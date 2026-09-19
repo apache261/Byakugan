@@ -1,0 +1,4994 @@
+openapi: 3.0.3
+info:
+  title: Byakugan API
+  version: 0.1.0
+  description: >-
+    Byakugan fraud detection microservice REST API for ISO 20022-style
+    pacs.008 bank transfer fraud checks. Administrative UI assets and routing
+    are owned by the independent dashboard container; this Go service exposes
+    only API, session, documentation, and operational endpoints.
+servers:
+  - url: http://localhost:9095
+    description: Docker Compose local server
+security:
+  - bearerAuth: []
+  - apiKeyAuth: []
+tags:
+  - name: Health
+  - name: Transfer Checks
+  - name: Accounts
+  - name: Rules
+  - name: Dashboard
+  - name: Notifications
+  - name: Admin
+  - name: Configuration
+  - name: AML
+paths:
+  /healthz:
+    get:
+      tags: [Health]
+      summary: Liveness check
+      security: []
+      responses:
+        "200":
+          description: Service is alive.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+              examples:
+                ok:
+                  value:
+                    status: ok
+                    version: 0.1.0
+                    build_number: "20260713010101"
+  /readyz:
+    get:
+      tags: [Health]
+      summary: Readiness check
+      description: Reports database schema readiness (currently version 34), configured cache health, and aggregate AML monitoring degradation/lag without confidential identifiers.
+      security: []
+      responses:
+        "200":
+          description: Service dependencies are ready.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadinessResponse"
+              examples:
+                ready:
+                  value:
+                    status: ready
+                    version: 0.1.0
+                    build_number: "20260713010101"
+        "503":
+          $ref: "#/components/responses/Error"
+  /metrics:
+    get:
+      tags: [Health]
+      summary: Prometheus-style application metrics
+      security: []
+      responses:
+        "200":
+          description: Text metrics.
+          content:
+            text/plain:
+              schema:
+                type: string
+  /admin/session:
+    get:
+      tags: [Admin]
+      summary: Check admin dashboard session
+      security: []
+      description: Internal/private address only. Returns whether the admin session cookie is authenticated.
+      responses:
+        "200":
+          description: Session status.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  authenticated:
+                    type: boolean
+                  username:
+                    type: string
+                    description: Authenticated administrator username; empty when unauthenticated.
+                  role:
+                    type: string
+                    description: Authenticated administrator role; empty when unauthenticated.
+                  modules:
+                    type: array
+                    items:
+                      type: string
+                    description: Dashboard modules assigned to the authenticated administrator.
+  /admin/login:
+    post:
+      tags: [Admin]
+      summary: Log in to the admin dashboard
+      security: []
+      description: Internal/private address only. Sets an HTTP-only, SameSite=Strict admin session cookie. Production HTTPS deployments enable its Secure attribute with ADMIN_SESSION_COOKIE_SECURE=true.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminLoginRequest"
+            examples:
+              localAdmin:
+                value:
+                  username: admin
+                  password: admin
+      responses:
+        "200":
+          description: Authenticated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+        "401":
+          $ref: "#/components/responses/Error"
+  /admin/logout:
+    post:
+      tags: [Admin]
+      summary: Log out of the admin dashboard
+      security: []
+      description: Clears the admin session cookie.
+      responses:
+        "200":
+          description: Logged out.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+  /v1/simulator/metadata:
+    get:
+      tags: [Dashboard]
+      summary: Get non-production simulator scenarios
+      description: Available only when ENABLE_SIMULATOR=true. Returns server-owned scenario labels and transfer templates for the standalone dashboard simulator.
+      responses:
+        "200":
+          description: Simulator metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SimulatorMetadata"
+        "404":
+          description: Simulator is disabled.
+  /v1/transfer-checks:
+    get:
+      tags: [Transfer Checks]
+      summary: List transfer checks
+      description: Paginated investigation list with decision, text, date, score, and amount filters.
+      parameters:
+        - in: query
+          name: page
+          schema:
+            type: integer
+            default: 1
+            minimum: 1
+        - in: query
+          name: page_size
+          schema:
+            type: integer
+            default: 25
+            minimum: 1
+            maximum: 100
+        - in: query
+          name: limit
+          description: Maximum number of recent checks loaded before filtering.
+          schema:
+            type: integer
+            default: 10000
+            maximum: 50000
+        - in: query
+          name: decision
+          schema:
+            type: string
+            enum: [all, allow, review, block]
+        - in: query
+          name: q
+          schema:
+            type: string
+          description: Searches IDs, account IDs, message IDs, instruction IDs, BICFI values, reasons, and rule hit text.
+        - in: query
+          name: date_from
+          schema:
+            type: string
+            description: RFC3339 timestamp or YYYY-MM-DD date.
+        - in: query
+          name: date_to
+          schema:
+            type: string
+            description: RFC3339 timestamp or YYYY-MM-DD date.
+        - in: query
+          name: min_score
+          schema:
+            type: number
+        - in: query
+          name: max_score
+          schema:
+            type: number
+        - in: query
+          name: min_amount
+          schema:
+            type: number
+        - in: query
+          name: max_amount
+          schema:
+            type: number
+      responses:
+        "200":
+          description: Paginated transfer checks.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedTransferChecks"
+    post:
+      tags: [Transfer Checks]
+      summary: Check a pacs.008 transfer for fraud
+      description: Accepts canonical JSON mapped to ISO 20022 pacs.008 concepts and returns a synchronous decision.
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          description: Optional client key. Reusing the same key with the same payload returns the original result; reusing it with a different payload is flagged by the duplicate idempotency rule and normally returns review.
+          schema:
+            type: string
+          required: false
+          example: sample-transfer-001
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TransferCheckRequest"
+            examples:
+              pacs008Transfer:
+                $ref: "#/components/examples/Pacs008TransferCheckRequest"
+              invalidTransfer:
+                $ref: "#/components/examples/InvalidTransferCheckRequest"
+      responses:
+        "201":
+          description: Fraud decision created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TransferCheck"
+              examples:
+                allow:
+                  $ref: "#/components/examples/TransferCheckAllowResponse"
+                review:
+                  $ref: "#/components/examples/TransferCheckReviewResponse"
+                block:
+                  $ref: "#/components/examples/TransferCheckBlockResponse"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+  /v1/transfer-checks/export:
+    get:
+      tags: [Transfer Checks]
+      summary: Export transfer checks
+      description: Exports the same filtered transfer-check set as the list endpoint. Use `format=json` for a structured export or `format=csv` for spreadsheet-friendly investigation files.
+      parameters:
+        - in: query
+          name: format
+          schema:
+            type: string
+            enum: [json, csv]
+            default: json
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            default: 10000
+            maximum: 50000
+        - in: query
+          name: decision
+          schema:
+            type: string
+            enum: [all, allow, review, block]
+        - in: query
+          name: q
+          schema:
+            type: string
+        - in: query
+          name: date_from
+          schema:
+            type: string
+        - in: query
+          name: date_to
+          schema:
+            type: string
+        - in: query
+          name: min_score
+          schema:
+            type: number
+        - in: query
+          name: max_score
+          schema:
+            type: number
+        - in: query
+          name: min_amount
+          schema:
+            type: number
+        - in: query
+          name: max_amount
+          schema:
+            type: number
+      responses:
+        "200":
+          description: Transfer check export.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TransferCheckExport"
+            text/csv:
+              schema:
+                type: string
+  /v1/transfer-checks/iso20022:
+    post:
+      tags: [Transfer Checks]
+      summary: Check a pacs.008 XML transfer for fraud
+      description: Accepts interoperable ISO 20022 pacs.008 XML. The parser searches by XML local-name, so namespace prefixes and bank/switch wrapper names do not need to match a hardcoded layout. It maps the first CdtTrfTxInf transaction to the internal canonical transfer request and returns the same synchronous fraud decision shape as the JSON endpoint.
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          description: Optional client key. Reusing the same key with the same payload returns the original result; reusing it with a different payload is flagged by the duplicate idempotency rule and normally returns review.
+          schema:
+            type: string
+          required: false
+          example: INS-XML-001
+      requestBody:
+        required: true
+        content:
+          application/xml:
+            schema:
+              type: string
+            examples:
+              pacs008Xml:
+                summary: pacs.008.001.08 XML transfer
+                value: |
+                  <?xml version="1.0" encoding="UTF-8"?>
+                  <Document xmlns="urn:iso:std:iso:20022:tech:xsd:pacs.008.001.08">
+                    <FIToFICstmrCdtTrf>
+                      <GrpHdr>
+                        <MsgId>MSG-XML-001</MsgId>
+                        <CreDtTm>2026-07-06T09:00:00Z</CreDtTm>
+                      </GrpHdr>
+                      <CdtTrfTxInf>
+                        <PmtId>
+                          <InstrId>INS-XML-001</InstrId>
+                          <EndToEndId>E2E-XML-001</EndToEndId>
+                          <TxId>TX-XML-001</TxId>
+                        </PmtId>
+                        <IntrBkSttlmAmt Ccy="PHP">1250.50</IntrBkSttlmAmt>
+                        <Dbtr><Nm>Juan Dela Cruz</Nm></Dbtr>
+                        <DbtrAcct><Id><Othr><Id>debtor-xml</Id></Othr></Id></DbtrAcct>
+                        <DbtrAgt><FinInstnId><BICFI>DEUTPHMM</BICFI></FinInstnId></DbtrAgt>
+                        <Cdtr><Nm>Maria Santos</Nm></Cdtr>
+                        <CdtrAcct><Id><Othr><Id>creditor-xml</Id></Othr></Id></CdtrAcct>
+                        <CdtrAgt><FinInstnId><BICFI>BOPIPHMM</BICFI></FinInstnId></CdtrAgt>
+                        <RmtInf><Ustrd>Invoice 1001</Ustrd></RmtInf>
+                      </CdtTrfTxInf>
+                    </FIToFICstmrCdtTrf>
+                  </Document>
+      responses:
+        "201":
+          description: Fraud decision created from XML input.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TransferCheck"
+              examples:
+                allow:
+                  $ref: "#/components/examples/TransferCheckAllowResponse"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+  /v1/transfer-checks/{id}:
+    get:
+      tags: [Transfer Checks]
+      summary: Get a transfer check
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      responses:
+        "200":
+          description: Transfer check.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TransferCheck"
+              examples:
+                allow:
+                  $ref: "#/components/examples/TransferCheckAllowResponse"
+        "404":
+          $ref: "#/components/responses/Error"
+  /v1/payment-statuses/iso20022:
+    post:
+      tags: [Transfer Checks]
+      summary: Receive an ISO 20022 pacs.002 XML payment status response
+      description: Accepts pacs.002 through a direct ISO Document or any service-specific outer wrapper, correlates its first TxInfAndSts to an existing pacs.008 transfer check, and persists operational payment status separately from the fraud decision. Wrapper discovery uses XML local names and does not depend on an InstaPay, RTP, BancNet, or other payment-service namespace. Correlation prioritizes original transaction ID, instruction ID, end-to-end ID, clearing-system reference, then message ID. XML signatures are detected but are not cryptographically verified by this endpoint. The canonical parser is not an XSD validation engine; service-specific profile validation belongs at the ingress adapter.
+      requestBody:
+        required: true
+        content:
+          application/xml:
+            schema:
+              type: string
+      responses:
+        "201":
+          description: Payment status report stored.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaymentStatusReport"
+        "200":
+          description: An idempotent duplicate of an existing payment status report.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaymentStatusReport"
+        "400":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+  /v1/payment-statuses:
+    get:
+      tags: [Transfer Checks]
+      summary: List received ISO 20022 payment status reports
+      parameters:
+        - in: query
+          name: transfer_check_id
+          schema: {type: string}
+        - in: query
+          name: limit
+          schema: {type: integer, default: 100, maximum: 1000}
+      responses:
+        "200":
+          description: Payment status reports, newest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/PaymentStatusReport"
+  /v1/transfer-checks/{id}/approve:
+    post:
+      tags: [Transfer Checks]
+      summary: Approve a reviewed transfer check
+      description: Changes a reviewed transfer decision to `allow` and records an audit event.
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      responses:
+        "200":
+          description: Transfer check approved.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TransferCheck"
+              examples:
+                approved:
+                  value:
+                    id: chk-002
+                    request:
+                      message_type: pacs.008
+                      payload:
+                        message_id: MSG-20260706-003
+                        creation_date_time: "2026-07-06T09:10:00Z"
+                        payment_identification:
+                          end_to_end_id: E2E-003
+                        instructed_amount:
+                          amount: 50000
+                          currency: PHP
+                        debtor_account:
+                          id: acct-debtor-001
+                        debtor_agent:
+                          bicfi: DEUTPHMM
+                        creditor_account:
+                          id: acct-creditor-001
+                        creditor_agent:
+                          bicfi: BOPIPHMM
+                    decision: allow
+                    score: 60
+                    reasons:
+                      - high value transfer exceeds review threshold
+                      - manually approved by fraud admin
+                    rule_hits:
+                      - rule_id: rule-large-php-transfer-review
+                        rule_name: High Value Transfer Review
+                        outcome: review
+                        score_delta: 60
+                        reason: high value transfer exceeds review threshold
+                    created_at: "2026-07-06T09:10:01Z"
+        "404":
+          $ref: "#/components/responses/Error"
+  /v1/accounts:
+    post:
+      tags: [Accounts]
+      summary: Create or update an account
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Account"
+            examples:
+              account:
+                $ref: "#/components/examples/AccountRequest"
+      responses:
+        "201":
+          description: Account saved.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Account"
+              examples:
+                account:
+                  $ref: "#/components/examples/AccountResponse"
+        "400":
+          $ref: "#/components/responses/Error"
+    get:
+      tags: [Accounts]
+      summary: List accounts
+      responses:
+        "200":
+          description: Accounts.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Account"
+              examples:
+                accounts:
+                  value:
+                    - id: acct-debtor-001
+                      bban: PH-DEBTOR-0001
+                      name: Juan Sender
+                      status: active
+                      risk_tier: medium
+                      metadata:
+                        country: PH
+                        default_currency: PHP
+                      created_at: "2026-07-06T09:00:00Z"
+                      updated_at: "2026-07-06T09:00:00Z"
+  /v1/accounts/import:
+    post:
+      tags: [Accounts]
+      summary: Import fraud-control accounts from CSV
+      description: >-
+        Accepts at most 4 MiB and 5,000 non-empty account rows. The required
+        columns are id and name. Optional columns are iban, bban, status,
+        risk_tier, and metadata_json. Each valid row is upserted independently
+        and the response reports row-level failures without echoing account
+        data.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+          text/csv:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: Per-row import results.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountImportResult"
+        "400":
+          $ref: "#/components/responses/Error"
+        "413":
+          description: The CSV upload exceeds the 4 MiB size limit.
+        "415":
+          description: Unsupported upload content type.
+  /v1/accounts/{id}:
+    get:
+      tags: [Accounts]
+      summary: Get an account
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      responses:
+        "200":
+          description: Account.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Account"
+              examples:
+                account:
+                  $ref: "#/components/examples/AccountResponse"
+        "404":
+          $ref: "#/components/responses/Error"
+    patch:
+      tags: [Accounts]
+      summary: Patch an account
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AccountPatch"
+            examples:
+              patchRisk:
+                value:
+                  risk_tier: high
+                  metadata:
+                    segment: corporate
+      responses:
+        "200":
+          description: Account updated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Account"
+        "404":
+          $ref: "#/components/responses/Error"
+  /v1/accounts/{id}/block:
+    post:
+      tags: [Accounts]
+      summary: Block an account
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      responses:
+        "200":
+          description: Account blocked.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Account"
+              examples:
+                blocked:
+                  value:
+                    id: acct-debtor-001
+                    bban: PH-DEBTOR-0001
+                    name: Juan Sender
+                    status: blocked
+                    risk_tier: high
+                    created_at: "2026-07-06T09:00:00Z"
+                    updated_at: "2026-07-06T09:10:00Z"
+        "404":
+          $ref: "#/components/responses/Error"
+  /v1/accounts/{id}/allow:
+    post:
+      tags: [Accounts]
+      summary: Explicitly allow an account
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      responses:
+        "200":
+          description: Account allowed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Account"
+  /v1/accounts/{id}/config:
+    get:
+      tags: [Accounts]
+      summary: Get per-account fraud configuration
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      responses:
+        "200":
+          description: Account config.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountConfig"
+              examples:
+                config:
+                  $ref: "#/components/examples/AccountConfigResponse"
+        "404":
+          $ref: "#/components/responses/Error"
+    put:
+      tags: [Accounts]
+      summary: Upsert per-account fraud configuration
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AccountConfig"
+            examples:
+              config:
+                $ref: "#/components/examples/AccountConfigRequest"
+      responses:
+        "200":
+          description: Account config saved.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountConfig"
+              examples:
+                config:
+                  $ref: "#/components/examples/AccountConfigResponse"
+  /v1/accounts/{id}/profile:
+    get:
+      tags: [Accounts]
+      summary: Get rolling account behavior profile
+      description: Returns a read-only profile generated from recent transfer history, including usual amounts, currencies, creditors, agents, active hours, frequency, and cold-start status.
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      responses:
+        "200":
+          description: Behavior profile.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BehaviorProfile"
+  /v1/accounts/{id}/profile/snapshots:
+    get:
+      tags: [Accounts]
+      summary: List auditable historical behavior-profile snapshots
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      responses:
+        "200": {description: Historical snapshots stored in the audit log.}
+    post:
+      tags: [Accounts]
+      summary: Record the current behavior profile as an audit snapshot
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      responses:
+        "201": {description: Snapshot recorded.}
+  /v1/rules:
+    post:
+      tags: [Rules]
+      summary: Create or update a portable JSON rule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Rule"
+            examples:
+              amountReviewRule:
+                $ref: "#/components/examples/AmountReviewRuleRequest"
+              routeBlockRule:
+                $ref: "#/components/examples/RouteBlockRuleRequest"
+      responses:
+        "201":
+          description: Rule saved.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Rule"
+              examples:
+                amountReviewRule:
+                  $ref: "#/components/examples/AmountReviewRuleResponse"
+    get:
+      tags: [Rules]
+      summary: List rules
+      responses:
+        "200":
+          description: Rules.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Rule"
+              examples:
+                rules:
+                  value:
+                    - id: rule-large-amount
+                      name: High Value Transfer Review
+                      scope: default
+                      priority: 10
+                      enabled: true
+                      version: 1
+                      definition:
+                        field: amount
+                        op: gte
+                        value: 50000
+                        outcome: review
+                        score: 60
+                        reason: high value transfer exceeds review threshold
+                      created_at: "2026-07-06T09:00:00Z"
+                      updated_at: "2026-07-06T09:00:00Z"
+  /v1/rules/simulate:
+    post:
+      tags: [Rules]
+      summary: Simulate a draft rule against a sample transfer
+      description: Evaluates a rule definition without saving it, so admins can test rules before activation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RuleSimulationRequest"
+      responses:
+        "200":
+          description: Simulation result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RuleSimulationResponse"
+  /v1/rules/metadata:
+    get:
+      tags: [Rules]
+      summary: Get visual rule-builder metadata
+      description: Returns the backend-owned field, operator, mode, outcome, and preset catalogs used by framework-free dashboard rule builders.
+      responses:
+        "200":
+          description: Rule-builder metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RuleBuilderMetadata"
+  /v1/rules/{id}:
+    patch:
+      tags: [Rules]
+      summary: Patch a rule
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RulePatch"
+            examples:
+              disable:
+                value:
+                  enabled: false
+      responses:
+        "200":
+          description: Rule updated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Rule"
+        "404":
+          $ref: "#/components/responses/Error"
+  /v1/rules/{id}/history:
+    get:
+      tags: [Rules]
+      summary: List immutable rule revisions
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      responses:
+        "200":
+          description: Newest-first rule revision history.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/RuleRevision"
+  /v1/rules/{id}/rollback:
+    post:
+      tags: [Rules]
+      summary: Restore a previous rule revision as a new version
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [version]
+              properties:
+                version:
+                  type: integer
+                  minimum: 1
+      responses:
+        "200":
+          description: Restored rule with a new monotonically increasing version.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Rule"
+        "404":
+          $ref: "#/components/responses/Error"
+  /v1/watchlist-entries:
+    get:
+      tags: [Configuration]
+      summary: List watchlist entries
+      description: Lists internal account, name, BIC, and keyword watchlist entries. Supports exact and normalized screening workflows.
+      parameters:
+        - in: query
+          name: type
+          schema:
+            type: string
+            enum: [account, name, bic, keyword]
+        - in: query
+          name: enabled
+          schema:
+            type: boolean
+        - in: query
+          name: q
+          schema:
+            type: string
+        - in: query
+          name: include_paused
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            default: 100
+        - in: query
+          name: offset
+          schema:
+            type: integer
+            default: 0
+      responses:
+        "200":
+          description: Paged watchlist entries.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WatchlistListResult"
+    post:
+      tags: [Configuration]
+      summary: Create a watchlist entry
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WatchlistEntry"
+      responses:
+        "201":
+          description: Watchlist entry saved.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WatchlistEntry"
+  /v1/watchlist-entries/{id}:
+    get:
+      tags: [Configuration]
+      summary: Get a watchlist entry
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      responses:
+        "200":
+          description: Watchlist entry.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WatchlistEntry"
+        "404":
+          $ref: "#/components/responses/Error"
+    patch:
+      tags: [Configuration]
+      summary: Patch a watchlist entry
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WatchlistEntryPatchRequest"
+      responses:
+        "200":
+          description: Watchlist entry updated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WatchlistEntry"
+        "404":
+          $ref: "#/components/responses/Error"
+  /v1/dashboard/summary:
+    get:
+      tags: [Dashboard]
+      summary: Decision counts
+      responses:
+        "200":
+          description: Dashboard summary.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DashboardSummary"
+              examples:
+                summary:
+                  value:
+                    total: 25
+                    allow: 18
+                    review: 5
+                    block: 2
+  /v1/dashboard/decisions:
+    get:
+      tags: [Dashboard]
+      summary: Search transfer decisions
+      description: Server-side monitoring queue search with pagination, date range, score, amount, decision, and text filters.
+      parameters:
+        - in: query
+          name: page
+          schema:
+            type: integer
+            default: 1
+        - in: query
+          name: page_size
+          schema:
+            type: integer
+            default: 25
+            maximum: 100
+        - in: query
+          name: decision
+          schema:
+            type: string
+            enum: [all, allow, review, block]
+        - in: query
+          name: q
+          schema:
+            type: string
+          description: Searches IDs, accounts, message IDs, instruction IDs, BICFI, reasons, and rule hit text.
+        - in: query
+          name: date_from
+          schema:
+            type: string
+            format: date
+        - in: query
+          name: date_to
+          schema:
+            type: string
+            format: date
+        - in: query
+          name: min_score
+          schema:
+            type: number
+        - in: query
+          name: max_score
+          schema:
+            type: number
+        - in: query
+          name: min_amount
+          schema:
+            type: number
+        - in: query
+          name: max_amount
+          schema:
+            type: number
+      responses:
+        "200":
+          description: Paginated transfer checks.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/TransferCheck"
+                  page:
+                    type: integer
+                  page_size:
+                    type: integer
+                  total:
+                    type: integer
+              examples:
+                decisions:
+                  value:
+                    page: 1
+                    page_size: 25
+                    total: 1
+                    items:
+                      - id: chk-001
+                        idempotency_key: sample-transfer-001
+                        decision: allow
+                        score: 0
+                        reasons:
+                          - no fraud signal detected
+                        rule_hits: []
+                        created_at: "2026-07-06T09:00:01Z"
+  /v1/dashboard/rule-hits:
+    get:
+      tags: [Dashboard]
+      summary: Recent rule hits
+      responses:
+        "200":
+          description: Rule hits.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/RuleHit"
+              examples:
+                hits:
+                  value:
+                    - rule_id: rule-large-amount
+                      rule_name: High Value Transfer Review
+                      outcome: review
+                      score_delta: 60
+                      reason: high value transfer exceeds review threshold
+  /v1/network/summary:
+    get:
+      tags: [Dashboard]
+      summary: Network and mule-pattern summary
+      description: Builds rolling account relationship summaries and flags fan-in, fan-out, pass-through, circular-flow, rapid movement, shared debtor-agent, and shared beneficiary patterns.
+      parameters:
+        - in: query
+          name: account_id
+          schema:
+            type: string
+          description: Optional account id to return a single account relationship summary.
+      responses:
+        "200":
+          description: Network summary.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkSummary"
+  /v1/webhooks:
+    get:
+      tags: [Notifications]
+      summary: List webhooks
+      description: Lists registered webhook destinations used by the outbound dispatcher.
+      responses:
+        "200":
+          description: Webhooks.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Webhook"
+              examples:
+                webhooks:
+                  value:
+                    - id: webhook-001
+                      url: https://example.test/fraud-events
+                      enabled: true
+                      created_at: "2026-07-06T09:00:00Z"
+                      updated_at: "2026-07-06T09:00:00Z"
+    post:
+      tags: [Notifications]
+      summary: Register a webhook
+      description: Registers an enabled webhook destination. The dispatcher triggers after matching transfer_check.decided audit events, filtered by notifications.policy.value.notify_on_decisions, which defaults to review and block. Manual approval events are sent by default through notifications.policy.value.notify_on_approvals. Confirmed fraud case closures send case.resolved_fraud so an ISO service can reject held transfers. Webhook bodies include the original transfer_check_request, the stored transfer_check, and a canonical pacs.002 status payload.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Webhook"
+            examples:
+              webhook:
+                value:
+                  url: https://example.test/fraud-events
+      responses:
+        "201":
+          description: Webhook created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Webhook"
+              examples:
+                webhook:
+                  value:
+                    id: webhook-001
+                    url: https://example.test/fraud-events
+                    enabled: true
+                    created_at: "2026-07-06T09:00:00Z"
+                    updated_at: "2026-07-06T09:00:00Z"
+  /v1/webhooks/{id}:
+    patch:
+      tags: [Notifications]
+      summary: Update a webhook
+      description: Updates a webhook destination URL and/or enabled status.
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WebhookPatchRequest"
+      responses:
+        "200":
+          description: Webhook updated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Webhook"
+        "404":
+          $ref: "#/components/responses/Error"
+  /v1/notification-attempts:
+    get:
+      tags: [Notifications]
+      summary: List notification attempts
+      description: Lists recent outbound webhook delivery attempts.
+      parameters:
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            default: 100
+            maximum: 1000
+      responses:
+        "200":
+          description: Notification attempts.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/NotificationAttempt"
+  /v1/notification-attempts/{id}/replay:
+    post:
+      tags: [Notifications]
+      summary: Replay a notification attempt
+      description: Replays the stored payload from a prior notification attempt to the same webhook destination.
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      responses:
+        "201":
+          description: Replay attempt created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotificationAttempt"
+        "404":
+          $ref: "#/components/responses/Error"
+  /v1/notification-attempts/dead-letter/export:
+    get:
+      tags: [Notifications]
+      summary: Export failed webhook attempts as a dead-letter report
+      responses:
+        "200":
+          description: Downloadable JSON dead-letter report with stored payloads and failure details.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /v1/cases:
+    get:
+      tags: [Cases]
+      summary: List fraud cases
+      description: Lists recent cases auto-created from review and block transfer decisions.
+      parameters:
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            default: 100
+            maximum: 1000
+        - in: query
+          name: offset
+          schema:
+            type: integer
+            default: 0
+        - in: query
+          name: status
+          schema:
+            type: string
+            enum: [open, investigating, escalated, resolved_safe, resolved_fraud, false_positive]
+        - in: query
+          name: decision
+          schema:
+            $ref: "#/components/schemas/Decision"
+        - in: query
+          name: priority
+          schema:
+            type: string
+        - in: query
+          name: queue
+          schema:
+            type: string
+        - in: query
+          name: assignee
+          schema:
+            type: string
+        - in: query
+          name: q
+          schema:
+            type: string
+          description: Searches case id, transfer check id, assignment fields, outcome, and case document text.
+        - in: query
+          name: include_closed
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Paged fraud cases.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CaseListResult"
+  /v1/cases/metrics:
+    get:
+      tags: [Cases]
+      summary: Get case workload, SLA, outcomes, and false-positive metrics
+      responses:
+        "200":
+          description: Current case operations metrics.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CaseMetrics"
+  /v1/cases/{id}:
+    get:
+      tags: [Cases]
+      summary: Get a fraud case with notes
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      responses:
+        "200":
+          description: Case detail.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  case:
+                    $ref: "#/components/schemas/FraudCase"
+                  notes:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/CaseNote"
+        "404":
+          $ref: "#/components/responses/Error"
+    patch:
+      tags: [Cases]
+      summary: Update a fraud case
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CasePatchRequest"
+      responses:
+        "200":
+          description: Case updated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FraudCase"
+  /v1/cases/{id}/notes:
+    get:
+      tags: [Cases]
+      summary: List case notes
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      responses:
+        "200":
+          description: Case notes.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/CaseNote"
+    post:
+      tags: [Cases]
+      summary: Add a case note
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CaseNoteCreateRequest"
+      responses:
+        "201":
+          description: Case note created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CaseNote"
+  /v1/cases/{id}/attachments:
+    get:
+      tags: [Cases]
+      summary: List stored case attachments
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      responses:
+        "200":
+          description: Case attachments without binary content.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/CaseAttachment"
+    post:
+      tags: [Cases]
+      summary: Upload a stored case attachment
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+      responses:
+        "201":
+          description: Case attachment stored.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CaseAttachment"
+  /v1/cases/{id}/attachments/{attachment_id}:
+    get:
+      tags: [Cases]
+      summary: Download a stored case attachment
+      parameters:
+        - $ref: "#/components/parameters/ID"
+        - in: path
+          name: attachment_id
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Attachment binary content.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "404":
+          $ref: "#/components/responses/Error"
+  /v1/cases/{id}/evidence:
+    get:
+      tags: [Cases]
+      summary: Export a unified investigation evidence package
+      description: Includes transfer, case, rule-hit, watchlist, behavior, network, audit, note, and attachment evidence. ZIP includes stored attachment binaries.
+      parameters:
+        - $ref: "#/components/parameters/ID"
+        - in: query
+          name: format
+          schema:
+            type: string
+            enum: [json, zip]
+            default: json
+      responses:
+        "200":
+          description: Investigation evidence JSON or ZIP archive.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+            application/zip:
+              schema:
+                type: string
+                format: binary
+        "404":
+          $ref: "#/components/responses/Error"
+  /v1/events:
+    get:
+      tags: [Notifications]
+      summary: List audit events
+      description: Database-backed pagination across all audit events with action, entity, entity ID, and date filters applied before counting and paging.
+      parameters:
+        - in: query
+          name: page
+          schema:
+            type: integer
+            default: 1
+            minimum: 1
+        - in: query
+          name: page_size
+          schema:
+            type: integer
+            default: 25
+            maximum: 100
+        - in: query
+          name: action
+          schema:
+            type: string
+          example: transfer_check.decided
+        - in: query
+          name: entity
+          schema:
+            type: string
+          example: transfer_check
+        - in: query
+          name: entity_id
+          schema:
+            type: string
+        - in: query
+          name: date_from
+          schema:
+            type: string
+        - in: query
+          name: date_to
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Audit events.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedAuditEvents"
+              examples:
+                events:
+                  value:
+                    page: 1
+                    page_size: 25
+                    total: 1
+                    items:
+                      - id: event-001
+                        action: transfer_check.decided
+                        entity: transfer_check
+                        entity_id: chk-001
+                        metadata:
+                          decision: allow
+                        created_at: "2026-07-06T09:00:01Z"
+  /v1/api-keys:
+    get:
+      tags: [Configuration]
+      summary: List client API keys
+      description: Internal/private address only and requires an admin session cookie. Returns API key metadata only. Raw secrets are never returned after creation.
+      responses:
+        "200":
+          description: API key metadata.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/APIKey"
+              examples:
+                keys:
+                  value:
+                    - id: key-001
+                      name: Client Application
+                      key_prefix: bfd_12345678
+                      scopes: [transfers:write]
+                      active: true
+                      created_at: "2026-07-06T09:00:00Z"
+                      expires_at: "2026-12-31T23:59:59Z"
+    post:
+      tags: [Configuration]
+      summary: Create a client API key
+      description: Internal/private address only and requires an admin session cookie. Returns the raw secret once. Store it immediately; later reads only show metadata.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/APIKeyCreateRequest"
+            examples:
+              clientKey:
+                value:
+                  name: Client Application
+                  scopes: [transfers:write, dashboard:read]
+                  expires_at: "2026-12-31T23:59:59Z"
+      responses:
+        "201":
+          description: API key created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/APIKeyCreateResponse"
+  /v1/api-keys/{id}:
+    patch:
+      tags: [Configuration]
+      summary: Update or deactivate a client API key
+      description: Internal/private address only and requires an admin session cookie.
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/APIKeyPatchRequest"
+            examples:
+              deactivate:
+                value:
+                  active: false
+      responses:
+        "200":
+          description: API key updated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/APIKey"
+  /v1/admin-accounts:
+    get:
+      tags: [Configuration]
+      summary: List dashboard admin accounts
+      description: Internal/private address only and requires an admin session cookie. The bootstrap environment admin is not returned because it is not DB-managed.
+      responses:
+        "200":
+          description: Admin account metadata.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/AdminAccount"
+              examples:
+                admins:
+                  value:
+                    - id: adm-001
+                      username: risk-admin
+                      allowed_ips: ["*"]
+                      active: true
+                      created_at: "2026-07-06T09:00:00Z"
+                      updated_at: "2026-07-06T09:00:00Z"
+    post:
+      tags: [Configuration]
+      summary: Create a dashboard admin account
+      description: Internal/private address only and requires an admin session cookie. Created accounts can log in to the admin dashboard with username and password.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminAccountCreateRequest"
+            examples:
+              adminAccount:
+                value:
+                  username: risk-admin
+                  password: change-me-now
+                  allowed_ips: ["10.0.0.0/8", "127.0.0.1"]
+      responses:
+        "201":
+          description: Admin account created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAccount"
+  /v1/admin-accounts/{id}:
+    patch:
+      tags: [Configuration]
+      summary: Update or revoke a dashboard admin account
+      description: Internal/private address only and requires an admin session cookie. Set active to false to revoke login access.
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminAccountPatchRequest"
+            examples:
+              revoke:
+                value:
+                  active: false
+              rotatePassword:
+                value:
+                  password: new-strong-password
+      responses:
+        "200":
+          description: Admin account updated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAccount"
+  /v1/configurations:
+    get:
+      tags: [Configuration]
+      summary: List DB-driven configuration entries
+      responses:
+        "200":
+          description: Configuration entries.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ConfigurationEntry"
+              examples:
+                configurations:
+                  value:
+                    - key: decision.defaults
+                      category: decisioning
+                      cache_ttl_seconds: 300
+                      value:
+                        default_currency: PHP
+                        default_country: PH
+                        review_threshold: 50
+                        block_threshold: 90
+                        validation_fail_decision: review
+                      updated_at: "2026-07-06T09:00:00Z"
+  /v1/configurations/{key}:
+    get:
+      tags: [Configuration]
+      summary: Get a cached DB-driven configuration entry
+      description: Uses the service configuration cache when `cache_ttl_seconds` is greater than zero.
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+          example: dashboard.options
+      responses:
+        "200":
+          description: Configuration entry.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConfigurationEntry"
+              examples:
+                dashboardOptions:
+                  value:
+                    key: dashboard.options
+                    category: dashboard
+                    cache_ttl_seconds: 300
+                    value:
+                      configuration_categories:
+                        - value: decisioning
+                          label: Decisioning
+                      defaults:
+                        configuration_category: decisioning
+                    updated_at: "2026-07-06T09:00:00Z"
+    put:
+      tags: [Configuration]
+      summary: Create or update a configuration entry
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+          example: decision.defaults
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ConfigurationEntry"
+      responses:
+        "200":
+          description: Configuration saved.
+  /v1/dropdown-items:
+    get:
+      tags: [Configuration]
+      summary: List generic dropdown registry items
+      description: Returns API-owned dropdown codes grouped by `group_id`. Dashboard consumers use enabled records instead of hardcoded choices.
+      parameters:
+        - name: group_id
+          in: query
+          schema:
+            type: string
+          description: Optional dropdown group filter.
+      responses:
+        "200":
+          description: Dropdown registry items.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/DropdownItem"
+    post:
+      tags: [Configuration]
+      summary: Create a dropdown registry item
+      description: Internal super-admin operation. `group_id` groups a reusable dropdown and `code_id` is its stable submitted value.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DropdownItem"
+      responses:
+        "200":
+          description: Dropdown item saved.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DropdownItem"
+  /v1/license/status:
+    get:
+      tags: [Configuration]
+      summary: Get the redacted offline license and replica-lease status
+      responses:
+        "200": {description: Non-secret license status.}
+  /v1/license/installation-request:
+    get:
+      tags: [Configuration]
+      summary: Download the air-gapped installation request
+      responses:
+        "200": {description: Unsigned installation request for the offline issuer.}
+  /v1/license/install:
+    post:
+      tags: [Configuration]
+      summary: Install or replace a signed offline license
+      description: Requires an internal super-admin session. API keys cannot install licenses.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: object}
+      responses:
+        "200": {description: Redacted validated license status.}
+        "400": {description: Invalid license envelope or claims.}
+  /v1/license/leases:
+    get:
+      tags: [Configuration]
+      summary: List active licensed API replica leases
+      responses:
+        "200": {description: Active leases.}
+  /v1/license/revalidate:
+    post:
+      tags: [Configuration]
+      summary: Force offline license and lease revalidation
+      responses:
+        "200": {description: Updated redacted license status.}
+  /v1/webhook-signing/status:
+    get:
+      tags: [Configuration]
+      summary: Report cloud-secret webhook signing rotation status
+      responses:
+        "200": {description: Key identifiers and configured state; secrets are never returned.}
+  /v1/policy-bundles/export:
+    get:
+      tags: [Configuration]
+      summary: Export environment-managed policy data
+      parameters:
+        - {name: source, in: query, schema: {type: string}}
+      responses:
+        "200": {description: Versioned rules, configurations, watchlists, and webhooks bundle.}
+  /v1/policy-bundles/import:
+    post:
+      tags: [Configuration]
+      summary: Validate or import a policy bundle
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: object}
+      responses:
+        "200": {description: Dry-run or applied record counts.}
+  /v1/simulation-fixtures:
+    get:
+      tags: [Simulator]
+      summary: List saved simulation fixtures
+      responses:
+        "200": {description: Saved regression fixtures.}
+    post:
+      tags: [Simulator]
+      summary: Save a simulation fixture
+      responses:
+        "200": {description: Fixture saved.}
+  /v1/simulation-fixtures/{id}:
+    parameters:
+      - {$ref: "#/components/parameters/ID"}
+    put:
+      tags: [Simulator]
+      summary: Update a simulation fixture
+      responses:
+        "200": {description: Fixture updated.}
+    delete:
+      tags: [Simulator]
+      summary: Delete a simulation fixture
+      responses:
+        "204": {description: Fixture deleted.}
+  /v1/scoring/reports:
+    get:
+      tags: [Configuration]
+      summary: Report external model score samples and decision outcomes
+      description: Supports shadow/champion/challenger monitoring without allowing a model to mutate deterministic rules.
+      responses:
+        "200": {description: Per-model/version samples, average score, decision counts, and reason-code counts.}
+  /v1/dropdown-items/{group_id}/{code_id}:
+    parameters:
+      - name: group_id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: code_id
+        in: path
+        required: true
+        schema:
+          type: string
+    put:
+      tags: [Configuration]
+      summary: Update a dropdown registry item
+      description: Internal super-admin operation. Path identifiers remain authoritative.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DropdownItem"
+      responses:
+        "200":
+          description: Dropdown item updated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DropdownItem"
+    delete:
+      tags: [Configuration]
+      summary: Delete a dropdown registry item
+      description: Internal super-admin operation. Existing domain records using the code are not rewritten.
+      responses:
+        "204":
+          description: Dropdown item deleted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConfigurationEntry"
+  /v1/configurations/cache/refresh:
+    post:
+      tags: [Configuration]
+      summary: Manually refresh cached configuration values
+      responses:
+        "200":
+          description: Cache refreshed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+  /v1/audit-reports/export:
+    get:
+      tags: [Admin]
+      summary: Export categorized administrator and fraud-operation audit evidence
+      description: Internal/private super-admin endpoint. Supports JSON and CSV exports for approvals, cases, policy, access, webhook, and general activity evidence.
+      parameters:
+        - in: query
+          name: category
+          schema:
+            type: string
+            enum: [all, approvals, cases, policy, access, webhooks, activity]
+        - in: query
+          name: format
+          schema:
+            type: string
+            enum: [json, csv]
+            default: json
+        - in: query
+          name: date_from
+          schema:
+            type: string
+        - in: query
+          name: date_to
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Downloadable audit report.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuditReport"
+            text/csv:
+              schema:
+                type: string
+  /v1/saved-views:
+    get:
+      tags: [Dashboard]
+      summary: List reusable operator views
+      parameters:
+        - in: query
+          name: module
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Saved filters and column presets for the requested dashboard module.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SavedView"
+    post:
+      tags: [Dashboard]
+      summary: Save reusable dashboard filters and columns
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SavedView"
+      responses:
+        "201":
+          description: View saved.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SavedView"
+  /v1/saved-views/{id}:
+    delete:
+      tags: [Dashboard]
+      summary: Delete a saved operator view
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      responses:
+        "200":
+          description: View deleted.
+        "404":
+          $ref: "#/components/responses/Error"
+  /v1/retention/preview:
+    post:
+      tags: [Configuration]
+      summary: Preview all records affected by retention
+      description: Internal/private super-admin endpoint. Always performs a non-destructive preview, including dependent cases, notes, attachments, rule hits, and webhook attempts.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RetentionPurgeRequest"
+      responses:
+        "200":
+          description: Retention impact preview.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RetentionPurgeResponse"
+        "400":
+          $ref: "#/components/responses/Error"
+  /v1/retention/purge:
+    post:
+      tags: [Configuration]
+      summary: Purge old persisted records
+      description: Internal/private super-admin endpoint. Transactionally deletes transfer checks and dependent rule hits, cases, notes, attachments, and notification attempts, plus audit events matching their cutoff. Use the preview endpoint first.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RetentionPurgeRequest"
+            examples:
+              dryRun:
+                value:
+                  older_than_days: 90
+                  dry_run: true
+              explicitCutoffs:
+                value:
+                  transfer_checks_before: "2026-01-01T00:00:00Z"
+                  audit_events_before: "2026-01-01T00:00:00Z"
+      responses:
+        "200":
+          description: Retention purge result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RetentionPurgeResponse"
+              examples:
+                result:
+                  value:
+                    dry_run: false
+                    transfer_checks_before: "2026-01-01T00:00:00Z"
+                    audit_events_before: "2026-01-01T00:00:00Z"
+                    transfer_checks_deleted: 1200
+                    audit_events_deleted: 2400
+        "400":
+          $ref: "#/components/responses/Error"
+  /v1/aml/options:
+    get:
+      tags: [AML]
+      summary: Get AML dashboard catalogs and role capabilities
+      description: Internal-only. Requires `aml:read`. Supplies all domain choices and UI capability mappings used by the standalone AML module.
+      responses:
+        "200":
+          description: API-owned AML workflow catalogs and capabilities.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /v1/aml/customers/{id}/snapshots:
+    parameters:
+      - $ref: "#/components/parameters/ID"
+    post:
+      tags: [AML]
+      summary: Append an immutable AML customer snapshot
+      description: Internal-only. Requires `aml:transactions:write`; a new customer also requires `customer_source`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AMLCustomerSnapshotCommand"
+      responses:
+        "200":
+          description: Idempotent replay.
+        "201":
+          description: Snapshot created.
+        "400":
+          $ref: "#/components/responses/AMLProblem"
+        "409":
+          $ref: "#/components/responses/AMLProblem"
+    get:
+      tags: [AML]
+      summary: List immutable AML customer snapshots
+      description: Internal-only. Requires `aml:read`.
+      responses:
+        "200":
+          description: Snapshot list.
+        "404":
+          $ref: "#/components/responses/AMLProblem"
+  /v1/aml/customers/{id}:
+    get:
+      tags: [AML]
+      summary: Get an AML customer and its snapshots
+      description: Internal-only. Requires `aml:read`.
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      responses:
+        "200":
+          description: Customer record.
+        "404":
+          $ref: "#/components/responses/AMLProblem"
+  /v1/aml/accounts/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ID"
+    put:
+      tags: [AML]
+      summary: Append an immutable AML account profile
+      description: Internal-only. Requires `aml:transactions:write`; a new account also requires `account_source` and `primary_customer_id`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AMLAccountProfileCommand"
+      responses:
+        "200":
+          description: Idempotent replay.
+        "201":
+          description: Profile created.
+        "400":
+          $ref: "#/components/responses/AMLProblem"
+        "409":
+          $ref: "#/components/responses/AMLProblem"
+    get:
+      tags: [AML]
+      summary: Get an AML account and its profiles
+      description: Internal-only. Requires `aml:read`.
+      responses:
+        "200":
+          description: Account record.
+        "404":
+          $ref: "#/components/responses/AMLProblem"
+  /v1/aml/transactions:
+    post:
+      tags: [AML]
+      summary: Ingest one canonical AML transaction
+      description: Internal-only and side-effect free with respect to payment authorization and AML monitoring. Requires `aml:transactions:write`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AMLTransaction"
+      responses:
+        "200":
+          description: Idempotent replay.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AMLIngestionResponse"
+        "201":
+          description: Transaction ingested.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AMLIngestionResponse"
+        "400":
+          $ref: "#/components/responses/AMLProblem"
+        "409":
+          $ref: "#/components/responses/AMLProblem"
+    get:
+      tags: [AML]
+      summary: List canonical AML transactions
+      description: Internal-only, stable keyset pagination. Requires `aml:read`.
+      parameters:
+        - $ref: "#/components/parameters/AMLCursor"
+        - $ref: "#/components/parameters/AMLLimit"
+        - name: subject_type
+          in: query
+          schema:
+            type: string
+        - name: subject_id
+          in: query
+          schema:
+            type: string
+        - name: event_from
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: event_to
+          in: query
+          schema:
+            type: string
+            format: date-time
+      responses:
+        "200":
+          description: Transaction page.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AMLTransactionPage"
+        "400":
+          $ref: "#/components/responses/AMLProblem"
+  /v1/aml/transactions/batch:
+    post:
+      tags: [AML]
+      summary: Ingest a bounded batch of canonical AML transactions
+      description: Internal-only. Accepts 1–500 records and returns a result for every record. Requires `aml:transactions:write`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AMLTransactionBatchRequest"
+      responses:
+        "200":
+          description: All records accepted or replayed.
+        "207":
+          description: At least one record was rejected; inspect per-record results.
+        "400":
+          $ref: "#/components/responses/AMLProblem"
+  /v1/aml/transactions/iso20022:
+    post:
+      tags: [AML]
+      summary: Adapt pacs.008 XML into the AML ledger
+      description: Internal-only. Does not invoke the fraud decision endpoint. Requires `aml:transactions:write`.
+      parameters:
+        - name: source_system
+          in: query
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/xml:
+            schema:
+              type: string
+      responses:
+        "200":
+          description: All adapted records accepted or replayed.
+        "207":
+          description: At least one adapted record was rejected.
+        "400":
+          $ref: "#/components/responses/AMLProblem"
+  /v1/aml/transactions/{id}:
+    get:
+      tags: [AML]
+      summary: Get a canonical AML transaction
+      description: Internal-only. Requires `aml:read`.
+      parameters:
+        - $ref: "#/components/parameters/ID"
+      responses:
+        "200":
+          description: Canonical transaction.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AMLTransaction"
+        "404":
+          $ref: "#/components/responses/AMLProblem"
+  /v1/aml/scenarios:
+    get:
+      tags: [AML]
+      summary: List AML scenario definitions
+      description: Internal-only. Requires `aml:read`.
+      responses:
+        "200": {description: Scenario list.}
+    post:
+      tags: [AML]
+      summary: Create a scenario and immutable version 1
+      description: Internal-only. Requires `aml:admin`; does not activate the scenario.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/AMLScenarioCreateCommand"}
+      responses:
+        "201": {description: Scenario created.}
+        "400": {$ref: "#/components/responses/AMLProblem"}
+        "409": {$ref: "#/components/responses/AMLProblem"}
+  /v1/aml/scenarios/{id}:
+    get:
+      tags: [AML]
+      summary: Get an AML scenario definition
+      description: Internal-only. Requires `aml:read`.
+      parameters: [{$ref: "#/components/parameters/ID"}]
+      responses:
+        "200": {description: Scenario definition.}
+        "404": {$ref: "#/components/responses/AMLProblem"}
+  /v1/aml/scenarios/{id}/versions:
+    parameters: [{$ref: "#/components/parameters/ID"}]
+    get:
+      tags: [AML]
+      summary: List immutable scenario versions
+      description: Internal-only. Requires `aml:read`.
+      responses:
+        "200": {description: Scenario version list.}
+    post:
+      tags: [AML]
+      summary: Append an immutable scenario version
+      description: Internal-only. Requires `aml:admin` and the scenario head ETag.
+      parameters: [{$ref: "#/components/parameters/AMLIfMatch"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/AMLScenarioVersion"}
+      responses:
+        "201": {description: Scenario version appended.}
+        "412": {$ref: "#/components/responses/AMLProblem"}
+        "428": {$ref: "#/components/responses/AMLProblem"}
+  /v1/aml/scenarios/{id}/activate:
+    post:
+      tags: [AML]
+      summary: Atomically activate an exact scenario and policy version
+      description: Internal-only. Requires `aml:admin`. Policy packs are never activated merely by import.
+      parameters:
+        - {$ref: "#/components/parameters/ID"}
+        - {$ref: "#/components/parameters/AMLIfMatch"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [scenario_version]
+              properties:
+                scenario_version: {type: integer, minimum: 1}
+                policy_pack_id: {type: string}
+      responses:
+        "200": {description: Scenario activated.}
+        "412": {$ref: "#/components/responses/AMLProblem"}
+        "428": {$ref: "#/components/responses/AMLProblem"}
+  /v1/aml/scenarios/{id}/deactivate:
+    post:
+      tags: [AML]
+      summary: Deactivate a scenario without changing version history
+      description: Internal-only. Requires `aml:admin`.
+      parameters:
+        - {$ref: "#/components/parameters/ID"}
+        - {$ref: "#/components/parameters/AMLIfMatch"}
+      responses:
+        "200": {description: Scenario deactivated.}
+        "412": {$ref: "#/components/responses/AMLProblem"}
+        "428": {$ref: "#/components/responses/AMLProblem"}
+  /v1/aml/scenarios/{id}/simulate:
+    post:
+      tags: [AML]
+      summary: Evaluate an exact scenario version without persistence
+      description: Internal-only. Requires `aml:admin`; never creates an alert or changes scenario state.
+      parameters: [{$ref: "#/components/parameters/ID"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/AMLScenarioSimulation"}
+      responses:
+        "200": {description: Explainable observation.}
+        "400": {$ref: "#/components/responses/AMLProblem"}
+  /v1/aml/scenarios/{id}/dry-run:
+    post:
+      tags: [AML]
+      summary: Dry-run an exact scenario version without persistence
+      description: Alias of simulation for policy-promotion workflows. Requires `aml:admin`.
+      parameters: [{$ref: "#/components/parameters/ID"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/AMLScenarioSimulation"}
+      responses:
+        "200": {description: Explainable observation.}
+  /v1/aml/policy-packs:
+    get:
+      tags: [AML]
+      summary: List immutable policy packs
+      description: Internal-only. Requires `aml:admin`.
+      responses:
+        "200": {description: Policy-pack list.}
+  /v1/aml/policy-packs/import:
+    post:
+      tags: [AML]
+      summary: Validate and atomically import a non-activating policy pack
+      description: Internal-only. Requires `aml:admin`; validates format, contract compatibility, and dependency hashes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/AMLPolicyPack"}
+      responses:
+        "200": {description: Idempotent content replay.}
+        "201": {description: Policy pack imported but not activated.}
+        "400": {$ref: "#/components/responses/AMLProblem"}
+        "409": {$ref: "#/components/responses/AMLProblem"}
+  /v1/aml/policy-packs/{id}/export:
+    get:
+      tags: [AML]
+      summary: Export an immutable policy pack
+      description: Internal-only attachment response. Requires `aml:admin`.
+      parameters: [{$ref: "#/components/parameters/ID"}]
+      responses:
+        "200": {description: Policy-pack JSON attachment.}
+        "404": {$ref: "#/components/responses/AMLProblem"}
+  /v1/aml/screening-results:
+    get:
+      tags: [AML]
+      summary: List confidential screening evidence
+      description: Internal-only. Requires `aml:investigate`.
+      parameters:
+        - {$ref: "#/components/parameters/AMLLimit"}
+        - {name: subject_type, in: query, schema: {type: string}}
+        - {name: subject_id, in: query, schema: {type: string}}
+      responses:
+        "200": {description: Screening-result page.}
+    post:
+      tags: [AML]
+      summary: Persist immutable screening evidence
+      description: Internal-only. Requires `aml:investigate`. Provider fuzzy matches must name their algorithm and confidence.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/AMLScreeningResult"}
+      responses:
+        "201": {description: Screening evidence created.}
+        "400": {$ref: "#/components/responses/AMLProblem"}
+  /v1/aml/screening-results/{id}:
+    get:
+      tags: [AML]
+      summary: Get confidential screening evidence
+      description: Internal-only. Requires `aml:investigate`.
+      parameters: [{$ref: "#/components/parameters/ID"}]
+      responses:
+        "200": {description: Screening result.}
+        "404": {$ref: "#/components/responses/AMLProblem"}
+  /v1/aml/screening-results/{id}/disposition:
+    patch:
+      tags: [AML]
+      summary: Append a screening disposition version
+      description: Internal-only. Requires `aml:investigate` and the current ETag.
+      parameters:
+        - {$ref: "#/components/parameters/ID"}
+        - {$ref: "#/components/parameters/AMLIfMatch"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [disposition, reason_code]
+              properties:
+                disposition: {type: string, enum: [reviewing, confirmed_match, false_positive, inconclusive]}
+                reason_code: {type: string, maxLength: 100}
+      responses:
+        "200": {description: Disposition appended.}
+        "409": {$ref: "#/components/responses/AMLProblem"}
+        "412": {$ref: "#/components/responses/AMLProblem"}
+        "428": {$ref: "#/components/responses/AMLProblem"}
+  /v1/aml/monitoring/options:
+    get:
+      tags: [AML]
+      summary: Get server-owned monitoring and alert choices
+      responses:
+        "200": {description: Monitoring option catalog.}
+  /v1/aml/monitoring/metrics:
+    get:
+      tags: [AML]
+      summary: Get low-cardinality AML monitoring telemetry
+      responses:
+        "200": {description: Queue depth, lag, evaluation, alert, retry, failure, and reconciliation metrics.}
+  /v1/aml/monitoring-runs:
+    get:
+      tags: [AML]
+      summary: List monitoring runs
+      parameters:
+        - {$ref: "#/components/parameters/AMLCursor"}
+        - {$ref: "#/components/parameters/AMLLimit"}
+        - {name: kind, in: query, schema: {type: string}}
+        - {name: status, in: query, schema: {type: string}}
+      responses:
+        "200": {description: Signed keyset-paginated monitoring runs.}
+  /v1/aml/monitoring-runs/reconcile:
+    post:
+      tags: [AML]
+      summary: Queue an AML reconciliation run
+      description: Internal-only. Requires `aml:admin`; this never changes a fraud decision.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [window_start, window_end]
+              properties:
+                window_start: {type: string, format: date-time}
+                window_end: {type: string, format: date-time}
+      responses:
+        "202": {description: Reconciliation queued.}
+  /v1/aml/monitoring-runs/{id}:
+    get:
+      tags: [AML]
+      summary: Get a monitoring run
+      parameters: [{$ref: "#/components/parameters/ID"}]
+      responses:
+        "200": {description: Monitoring run and reconciliation counts.}
+  /v1/aml/monitoring-runs/{id}/replay:
+    post:
+      tags: [AML]
+      summary: Replay a monitoring run using its immutable versions and window
+      parameters: [{$ref: "#/components/parameters/ID"}]
+      responses:
+        "202": {description: Replay queued with the source run as parent.}
+  /v1/aml/monitoring-runs/{id}/cancel:
+    post:
+      tags: [AML]
+      summary: Cancel monitoring work before it is leased
+      parameters:
+        - {$ref: "#/components/parameters/ID"}
+        - {$ref: "#/components/parameters/AMLIfMatch"}
+      responses:
+        "200": {description: Queued run cancelled.}
+        "412": {$ref: "#/components/responses/AMLProblem"}
+        "428": {$ref: "#/components/responses/AMLProblem"}
+  /v1/aml/alerts:
+    get:
+      tags: [AML]
+      summary: List confidential explainable AML alerts
+      description: Internal-only. Requires `aml:investigate`.
+      parameters:
+        - {$ref: "#/components/parameters/AMLCursor"}
+        - {$ref: "#/components/parameters/AMLLimit"}
+        - {name: status, in: query, schema: {type: string}}
+        - {name: severity, in: query, schema: {type: string}}
+        - {name: scenario_id, in: query, schema: {type: string}}
+        - {name: subject_type, in: query, schema: {type: string}}
+        - {name: subject_id, in: query, schema: {type: string}}
+      responses:
+        "200": {description: Signed keyset-paginated alert page.}
+  /v1/aml/alerts/{id}:
+    get:
+      tags: [AML]
+      summary: Get an explainable alert with immutable evidence and history
+      parameters: [{$ref: "#/components/parameters/ID"}]
+      responses:
+        "200": {description: Alert.}
+  /v1/aml/alerts/{id}/assign:
+    post:
+      tags: [AML]
+      summary: Assign an alert
+      parameters: [{$ref: "#/components/parameters/ID"}, {$ref: "#/components/parameters/AMLIfMatch"}]
+      responses: {"200": {description: Alert assigned.}}
+  /v1/aml/alerts/{id}/triage:
+    post:
+      tags: [AML]
+      summary: Triage an alert
+      parameters: [{$ref: "#/components/parameters/ID"}, {$ref: "#/components/parameters/AMLIfMatch"}]
+      responses: {"200": {description: Alert triaged.}}
+  /v1/aml/alerts/{id}/investigate:
+    post:
+      tags: [AML]
+      summary: Move an alert into investigation
+      parameters: [{$ref: "#/components/parameters/ID"}, {$ref: "#/components/parameters/AMLIfMatch"}]
+      responses: {"200": {description: Alert under investigation.}}
+  /v1/aml/alerts/{id}/escalate:
+    post:
+      tags: [AML]
+      summary: Escalate an alert
+      parameters: [{$ref: "#/components/parameters/ID"}, {$ref: "#/components/parameters/AMLIfMatch"}]
+      responses: {"200": {description: Alert escalated.}}
+  /v1/aml/alerts/{id}/close:
+    post:
+      tags: [AML]
+      summary: Close an alert with an allowlisted reason
+      parameters: [{$ref: "#/components/parameters/ID"}, {$ref: "#/components/parameters/AMLIfMatch"}]
+      responses: {"200": {description: Alert closed without changing any payment decision.}}
+  /v1/aml/cases:
+    get:
+      tags: [AML]
+      summary: List AML investigation cases
+      description: Internal-only, signed keyset pagination. Requires `aml:investigate`.
+      parameters:
+        - {$ref: "#/components/parameters/AMLCursor"}
+        - {$ref: "#/components/parameters/AMLLimit"}
+        - {name: status, in: query, schema: {type: string, enum: [open, investigating, escalated, closed]}}
+        - {name: disposition, in: query, schema: {type: string, enum: [suspicious, no_suspicion, inconclusive]}}
+        - {name: assignee_id, in: query, schema: {type: string}}
+        - {name: alert_id, in: query, schema: {type: string}}
+      responses: {"200": {description: Case page.}}
+    post:
+      tags: [AML]
+      summary: Open a case and atomically group one or more alerts
+      description: Internal-only. Requires `aml:investigate`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/AMLCaseCreate"}
+      responses:
+        "201": {description: Case created.}
+        "400": {$ref: "#/components/responses/AMLProblem"}
+        "409": {$ref: "#/components/responses/AMLProblem"}
+  /v1/aml/cases/{id}:
+    get:
+      tags: [AML]
+      summary: Get a case with its append-only history
+      parameters: [{$ref: "#/components/parameters/ID"}]
+      responses:
+        "200": {description: Case and current ETag.}
+        "404": {$ref: "#/components/responses/AMLProblem"}
+  /v1/aml/cases/{id}/alerts:
+    post:
+      tags: [AML]
+      summary: Link another alert to a case
+      parameters: [{$ref: "#/components/parameters/ID"}, {$ref: "#/components/parameters/AMLIfMatch"}]
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [alert_id], properties: {alert_id: {type: string}}}}}}
+      responses: {"200": {description: Alert linked.}, "412": {$ref: "#/components/responses/AMLProblem"}, "428": {$ref: "#/components/responses/AMLProblem"}}
+  /v1/aml/cases/{id}/assign:
+    post:
+      tags: [AML]
+      summary: Assign a case
+      parameters: [{$ref: "#/components/parameters/ID"}, {$ref: "#/components/parameters/AMLIfMatch"}]
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [assignee_id], properties: {assignee_id: {type: string}, reason_code: {type: string}}}}}}
+      responses: {"200": {description: Case assigned.}, "412": {$ref: "#/components/responses/AMLProblem"}, "428": {$ref: "#/components/responses/AMLProblem"}}
+  /v1/aml/cases/{id}/investigate:
+    post:
+      tags: [AML]
+      summary: Move a case into investigation
+      parameters: [{$ref: "#/components/parameters/ID"}, {$ref: "#/components/parameters/AMLIfMatch"}]
+      requestBody: {required: true, content: {application/json: {schema: {type: object, properties: {reason_code: {type: string}}}}}}
+      responses: {"200": {description: Case under investigation.}}
+  /v1/aml/cases/{id}/escalate:
+    post:
+      tags: [AML]
+      summary: Escalate a case
+      parameters: [{$ref: "#/components/parameters/ID"}, {$ref: "#/components/parameters/AMLIfMatch"}]
+      requestBody: {required: true, content: {application/json: {schema: {type: object, properties: {reason_code: {type: string}}}}}}
+      responses: {"200": {description: Case escalated.}}
+  /v1/aml/cases/{id}/close:
+    post:
+      tags: [AML]
+      summary: Close a case with a disposition and rationale
+      parameters: [{$ref: "#/components/parameters/ID"}, {$ref: "#/components/parameters/AMLIfMatch"}]
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [disposition, rationale], properties: {disposition: {type: string, enum: [suspicious, no_suspicion, inconclusive]}, rationale: {type: string}, reason_code: {type: string}}}}}}
+      responses: {"200": {description: Case closed.}}
+  /v1/aml/cases/{id}/reopen:
+    post:
+      tags: [AML]
+      summary: Reopen a closed case
+      parameters: [{$ref: "#/components/parameters/ID"}, {$ref: "#/components/parameters/AMLIfMatch"}]
+      requestBody: {required: true, content: {application/json: {schema: {type: object, properties: {reason_code: {type: string}}}}}}
+      responses: {"200": {description: Case reopened.}}
+  /v1/aml/cases/{id}/notes:
+    get:
+      tags: [AML]
+      summary: List immutable case notes
+      parameters: [{$ref: "#/components/parameters/ID"}]
+      responses: {"200": {description: Case notes.}}
+    post:
+      tags: [AML]
+      summary: Append a case note
+      parameters: [{$ref: "#/components/parameters/ID"}]
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [body], properties: {body: {type: string, maxLength: 10000}}}}}}
+      responses: {"201": {description: Note appended.}}
+  /v1/aml/cases/{id}/attachments:
+    get:
+      tags: [AML]
+      summary: List protected attachment metadata
+      parameters: [{$ref: "#/components/parameters/ID"}]
+      responses: {"200": {description: Attachment metadata; storage keys are never returned.}}
+    post:
+      tags: [AML]
+      summary: Upload a protected case attachment
+      description: Maximum 10 MiB. Requires `aml:investigate`; blob bytes are stored outside the relational database.
+      parameters: [{$ref: "#/components/parameters/ID"}]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema: {type: object, required: [attachment], properties: {attachment: {type: string, format: binary}}}
+      responses: {"201": {description: Attachment metadata created.}, "400": {$ref: "#/components/responses/AMLProblem"}}
+  /v1/aml/cases/{id}/attachments/{attachment_id}:
+    get:
+      tags: [AML]
+      summary: Download a verified protected attachment
+      parameters:
+        - {$ref: "#/components/parameters/ID"}
+        - {name: attachment_id, in: path, required: true, schema: {type: string}}
+      responses: {"200": {description: Attachment bytes with SHA-256 response header.}, "404": {$ref: "#/components/responses/AMLProblem"}}
+  /v1/aml/cases/{id}/evidence:
+    get:
+      tags: [AML]
+      summary: Export deterministic case evidence ZIP
+      description: Includes immutable manifest, linked alerts and transactions, and verified attachments. Requires `aml:investigate`.
+      parameters: [{$ref: "#/components/parameters/ID"}]
+      responses: {"200": {description: Deterministic ZIP evidence package.}}
+  /v1/aml/reports:
+    get:
+      tags: [AML]
+      summary: List suspicious activity reports
+      parameters: [{$ref: "#/components/parameters/AMLCursor"}, {$ref: "#/components/parameters/AMLLimit"}, {name: status, in: query, schema: {type: string}}, {name: case_id, in: query, schema: {type: string}}]
+      responses: {"200": {description: Report page.}}
+    post:
+      tags: [AML]
+      summary: Create report draft version 1 from a suspiciously disposed case
+      requestBody: {required: true, content: {application/json: {schema: {$ref: "#/components/schemas/AMLReportCreate"}}}}
+      responses: {"201": {description: Report draft created.}, "409": {$ref: "#/components/responses/AMLProblem"}}
+  /v1/aml/reports/{id}:
+    get:
+      tags: [AML]
+      summary: Get a report head and its immutable current version
+      parameters: [{$ref: "#/components/parameters/ID"}]
+      responses: {"200": {description: Report and current version.}}
+  /v1/aml/reports/{id}/versions:
+    post:
+      tags: [AML]
+      summary: Append an immutable report version and return the head to draft
+      parameters: [{$ref: "#/components/parameters/ID"}, {$ref: "#/components/parameters/AMLIfMatch"}]
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [content], properties: {content: {type: object, additionalProperties: true}}}}}}
+      responses: {"201": {description: Version appended.}, "412": {$ref: "#/components/responses/AMLProblem"}, "428": {$ref: "#/components/responses/AMLProblem"}}
+  /v1/aml/reports/{id}/review:
+    post:
+      tags: [AML]
+      summary: Submit a report draft for review
+      parameters: [{$ref: "#/components/parameters/ID"}, {$ref: "#/components/parameters/AMLIfMatch"}]
+      requestBody: {required: true, content: {application/json: {schema: {type: object, properties: {reason_code: {type: string}}}}}}
+      responses: {"200": {description: Report submitted.}}
+  /v1/aml/reports/{id}/approve:
+    post:
+      tags: [AML]
+      summary: Approve the current immutable report version
+      description: Requires `aml:approve`, an interactive supervisor session, and an approver different from the version author.
+      parameters: [{$ref: "#/components/parameters/ID"}, {$ref: "#/components/parameters/AMLIfMatch"}]
+      requestBody: {required: true, content: {application/json: {schema: {type: object, properties: {reason_code: {type: string}}}}}}
+      responses: {"200": {description: Report approved.}, "403": {$ref: "#/components/responses/AMLProblem"}, "409": {$ref: "#/components/responses/AMLProblem"}}
+  /v1/aml/reports/{id}/withdraw:
+    post:
+      tags: [AML]
+      summary: Withdraw an approved or exported report
+      description: Requires `aml:approve` and an interactive supervisor session.
+      parameters: [{$ref: "#/components/parameters/ID"}, {$ref: "#/components/parameters/AMLIfMatch"}]
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [reason_code], properties: {reason_code: {type: string}}}}}}
+      responses: {"200": {description: Report withdrawn.}, "403": {$ref: "#/components/responses/AMLProblem"}}
+  /v1/aml/reports/{id}/export:
+    post:
+      tags: [AML]
+      summary: Export deterministic approved report bytes
+      description: Requires `aml:approve` and an interactive `aml_supervisor` or `super_admin` session; API keys are rejected.
+      parameters: [{$ref: "#/components/parameters/ID"}, {$ref: "#/components/parameters/AMLIfMatch"}]
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [format], properties: {format: {type: string, enum: [json, zip]}}}}}}
+      responses: {"200": {description: Deterministic report attachment.}, "403": {$ref: "#/components/responses/AMLProblem"}, "412": {$ref: "#/components/responses/AMLProblem"}, "428": {$ref: "#/components/responses/AMLProblem"}}
+  /v1/aml/legal-holds:
+    get:
+      tags: [AML]
+      summary: List legal holds
+      description: Requires `aml:admin`.
+      parameters: [{name: status, in: query, schema: {type: string, enum: [active, released]}}]
+      responses: {"200": {description: Legal holds.}}
+    post:
+      tags: [AML]
+      summary: Create an auditable legal hold
+      description: Requires `aml:admin`; targets are validated before creation.
+      requestBody: {required: true, content: {application/json: {schema: {$ref: "#/components/schemas/AMLLegalHoldCreate"}}}}
+      responses: {"201": {description: Legal hold created.}, "404": {$ref: "#/components/responses/AMLProblem"}}
+  /v1/aml/legal-holds/{id}:
+    get:
+      tags: [AML]
+      summary: Get a legal hold and its immutable history
+      parameters: [{$ref: "#/components/parameters/ID"}]
+      responses: {"200": {description: Legal hold.}}
+  /v1/aml/legal-holds/{id}/release:
+    post:
+      tags: [AML]
+      summary: Release a legal hold with a required reason
+      parameters: [{$ref: "#/components/parameters/ID"}, {$ref: "#/components/parameters/AMLIfMatch"}]
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [reason], properties: {reason: {type: string}}}}}}
+      responses: {"200": {description: Legal hold released.}, "412": {$ref: "#/components/responses/AMLProblem"}, "428": {$ref: "#/components/responses/AMLProblem"}}
+  /v1/aml/retention/preview:
+    post:
+      tags: [AML]
+      summary: Preview graph-aware AML retention impact
+      description: Requires `aml:admin`; returns hold dependency paths and a short-lived actor-bound preview token.
+      requestBody: {required: true, content: {application/json: {schema: {$ref: "#/components/schemas/AMLRetentionRequest"}}}}
+      responses: {"200": {description: Retention impact and preview token.}}
+  /v1/aml/retention/purge:
+    post:
+      tags: [AML]
+      summary: Execute a previously previewed AML retention purge
+      description: Requires `aml:admin` and an interactive `aml_admin` or `super_admin` session; active direct and transitive holds remain preserved.
+      requestBody: {required: true, content: {application/json: {schema: {$ref: "#/components/schemas/AMLRetentionRequest"}}}}
+      responses: {"200": {description: Purged and blocked counts.}, "428": {$ref: "#/components/responses/AMLProblem"}}
+  /v1/aml/mapping-profiles:
+    get:
+      tags: [AML]
+      summary: List immutable import mapping profiles
+      responses: {"200": {description: Mapping profile list.}}
+    post:
+      tags: [AML]
+      summary: Create an import mapping profile
+      requestBody: {required: true, content: {application/json: {schema: {$ref: "#/components/schemas/AMLMappingProfileCommand"}}}}
+      responses: {"201": {description: Mapping profile created.}, "400": {$ref: "#/components/responses/AMLProblem"}}
+  /v1/aml/mapping-profiles/{id}:
+    get:
+      tags: [AML]
+      summary: Get a mapping profile and immutable versions
+      parameters: [{$ref: "#/components/parameters/ID"}]
+      responses: {"200": {description: Mapping profile.}, "404": {$ref: "#/components/responses/AMLProblem"}}
+  /v1/aml/mapping-profiles/{id}/versions:
+    post:
+      tags: [AML]
+      summary: Append an immutable mapping version
+      parameters: [{$ref: "#/components/parameters/ID"}, {$ref: "#/components/parameters/AMLIfMatch"}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: "#/components/schemas/AMLMappingProfileCommand"}}}}
+      responses: {"201": {description: Mapping version created.}, "412": {$ref: "#/components/responses/AMLProblem"}}
+  /v1/aml/imports:
+    get:
+      tags: [AML]
+      summary: List AML imports
+      responses: {"200": {description: Import list.}}
+    post:
+      tags: [AML]
+      summary: Stream a protected source file and create an AML import
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, source_system, entity_type, format, mapping_profile_id]
+              properties:
+                file: {type: string, format: binary}
+                source_system: {type: string, maxLength: 100}
+                entity_type: {type: string, enum: [customer, customer_snapshot, account, account_profile, beneficial_owner, related_party, relationship, transaction, internal_watchlist, screening_result, legacy_alert, legacy_case]}
+                format: {type: string, enum: [csv, json, ndjson, pacs008]}
+                mapping_profile_id: {type: string}
+                monitoring_mode: {type: string, enum: [suppressed, eligible], default: suppressed}
+      responses: {"201": {description: Import uploaded.}, "400": {$ref: "#/components/responses/AMLProblem"}}
+  /v1/aml/imports/{id}:
+    get:
+      tags: [AML]
+      summary: Get import state, checkpoint, and reconciliation
+      parameters: [{$ref: "#/components/parameters/ID"}]
+      responses: {"200": {description: Import.}, "404": {$ref: "#/components/responses/AMLProblem"}}
+  /v1/aml/imports/options:
+    get:
+      tags: [AML]
+      summary: Get API-owned import choices and hard limits
+      responses: {"200": {description: Import option registry.}}
+  /v1/aml/imports/{id}/validate:
+    post:
+      tags: [AML]
+      summary: Dry-run validate an import without business-record mutation
+      parameters: [{$ref: "#/components/parameters/ID"}, {$ref: "#/components/parameters/AMLIfMatch"}]
+      responses: {"200": {description: Validation classification.}, "412": {$ref: "#/components/responses/AMLProblem"}}
+  /v1/aml/imports/{id}/commit:
+    post:
+      tags: [AML]
+      summary: Commit the validated hash-bound record set
+      parameters: [{$ref: "#/components/parameters/ID"}, {$ref: "#/components/parameters/AMLIfMatch"}, {$ref: "#/components/parameters/AMLIdempotencyKey"}]
+      responses: {"200": {description: Import committed.}, "409": {$ref: "#/components/responses/AMLProblem"}}
+  /v1/aml/imports/{id}/retry:
+    post:
+      tags: [AML]
+      summary: Upload corrected quarantined records and retain retry lineage
+      parameters: [{$ref: "#/components/parameters/ID"}, {$ref: "#/components/parameters/AMLIfMatch"}]
+      requestBody: {required: true, content: {multipart/form-data: {schema: {type: object, required: [file], properties: {file: {type: string, format: binary}}}}}}
+      responses: {"200": {description: Import revalidated.}}
+  /v1/aml/imports/{id}/cancel:
+    post:
+      tags: [AML]
+      summary: Cooperatively cancel an import
+      parameters: [{$ref: "#/components/parameters/ID"}, {$ref: "#/components/parameters/AMLIfMatch"}]
+      responses: {"200": {description: Import cancelled.}}
+  /v1/aml/imports/{id}/monitor:
+    post:
+      tags: [AML]
+      summary: Estimate or authorize historical monitoring after completion
+      parameters: [{$ref: "#/components/parameters/ID"}, {$ref: "#/components/parameters/AMLIfMatch"}, {$ref: "#/components/parameters/AMLIdempotencyKey"}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: "#/components/schemas/AMLBackfillCommand"}}}}
+      responses: {"200": {description: Backfill reference authorized.}, "409": {$ref: "#/components/responses/AMLProblem"}}
+  /v1/aml/imports/{id}/errors:
+    get:
+      tags: [AML]
+      summary: Export formula-safe quarantine errors
+      parameters: [{$ref: "#/components/parameters/ID"}]
+      responses: {"200": {description: Quarantine CSV., content: {text/csv: {schema: {type: string}}}}}
+  /v1/aml/backfills/{id}:
+    get:
+      tags: [AML]
+      summary: Get backfill selection, progress, and reconciliation state
+      parameters: [{$ref: "#/components/parameters/ID"}]
+      responses: {"200": {description: Backfill status.}, "404": {$ref: "#/components/responses/AMLProblem"}}
+  /v1/aml/backfills/{id}/cancel:
+    post:
+      tags: [AML]
+      summary: Cancel the queued or running monitoring job for a backfill
+      parameters: [{$ref: "#/components/parameters/ID"}, {$ref: "#/components/parameters/AMLIfMatch"}]
+      responses: {"200": {description: Backfill cancelled.}, "409": {$ref: "#/components/responses/AMLProblem"}}
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: "Use `Authorization: Bearer dev-secret`."
+    apiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+  parameters:
+    AMLIdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: {type: string, maxLength: 200}
+    AMLIfMatch:
+      name: If-Match
+      in: header
+      required: true
+      description: Quoted current positive resource version.
+      schema: {type: string, pattern: '^"[1-9][0-9]*"$'}
+    AMLCursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque, signed, filter-bound keyset cursor returned by the preceding page.
+      schema:
+        type: string
+        maxLength: 4096
+    AMLLimit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 500
+        default: 50
+    ID:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+      example: acct-debtor-001
+  responses:
+    AMLProblem:
+      description: AML validation, conflict, lookup, or authorization-safe error.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AMLProblem"
+    Error:
+      description: Error response.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          examples:
+            error:
+              value:
+                error: not found
+  schemas:
+    AMLMappingProfileCommand:
+      type: object
+      required: [name, entity_type, format, fields]
+      properties:
+        name: {type: string, maxLength: 200}
+        entity_type: {type: string, enum: [customer, customer_snapshot, account, account_profile, beneficial_owner, related_party, relationship, transaction, internal_watchlist, screening_result, legacy_alert, legacy_case]}
+        format: {type: string, enum: [csv, json, ndjson, pacs008]}
+        fields: {type: object, maxProperties: 100, additionalProperties: {type: string}}
+    AMLBackfillCommand:
+      type: object
+      required: [window_start, window_end]
+      properties:
+        window_start: {type: string, format: date-time}
+        window_end: {type: string, format: date-time}
+        scenario_versions: {type: array, maxItems: 100, items: {type: object, required: [scenario_id, scenario_version], properties: {scenario_id: {type: string}, scenario_version: {type: integer, minimum: 1}}}}
+        policy_pack_id: {type: string}
+        dry_run: {type: boolean, default: false}
+        rate_per_second: {type: integer, minimum: 1, maximum: 10000, default: 100}
+        concurrency: {type: integer, minimum: 1, maximum: 16, default: 1}
+    AMLProblem:
+      type: object
+      required: [error, code, request_id]
+      properties:
+        error:
+          type: string
+        code:
+          type: string
+          enum: [validation_failed, not_found, source_identity_conflict, immutable_conflict, effective_interval_overlap, invalid_lineage, invalid_cursor, cursor_filter_mismatch, batch_size_invalid, version_conflict, invalid_transition, four_eyes_violation, legal_hold_conflict, interactive_session_required, precondition_required, aml_unavailable, audit_persistence_failed, internal_error]
+        request_id:
+          type: string
+        details:
+          type: object
+          additionalProperties: true
+    AMLCaseCreate:
+      type: object
+      required: [title, alert_ids]
+      properties:
+        title: {type: string, minLength: 1, maxLength: 300}
+        alert_ids: {type: array, minItems: 1, maxItems: 100, uniqueItems: true, items: {type: string}}
+    AMLReportCreate:
+      type: object
+      required: [case_id, content]
+      properties:
+        case_id: {type: string}
+        content: {type: object, additionalProperties: true}
+    AMLLegalHoldCreate:
+      type: object
+      required: [target, reason, authority_reference]
+      properties:
+        target:
+          type: object
+          required: [type, id]
+          properties:
+            type: {type: string, enum: [customer, account, transaction, alert, case, report, evidence]}
+            id: {type: string}
+        reason: {type: string}
+        authority_reference: {type: string}
+        starts_at: {type: string, format: date-time}
+        ends_at: {type: string, format: date-time}
+    AMLRetentionRequest:
+      type: object
+      required: [before]
+      properties:
+        before: {type: string, format: date-time}
+        preview_token: {type: string, description: Required only for purge.}
+    AMLScenarioNode:
+      type: object
+      description: Bounded declarative AML DSL v1 node; exactly one node family is accepted.
+      properties:
+        all: {type: array, maxItems: 50, items: {$ref: "#/components/schemas/AMLScenarioNode"}}
+        any: {type: array, maxItems: 50, items: {$ref: "#/components/schemas/AMLScenarioNode"}}
+        not: {$ref: "#/components/schemas/AMLScenarioNode"}
+        field: {type: string}
+        metric: {type: string, enum: [count, sum, distinct_count, repeated_value_count, first_seen_age, active_span]}
+        network_metric: {type: string, enum: [fan_in, fan_out, shared_counterparty, circular_flow, pass_through]}
+        operator: {type: string, enum: [eq, neq, in, not_in, contains, starts_with, exists, gt, gte, lt, lte]}
+        value: {}
+        policy_ref: {type: string}
+        subject_basis: {type: string}
+        window_seconds: {type: integer, minimum: 1, maximum: 31622400}
+    AMLScenarioVersion:
+      type: object
+      required: [typology, execution_modes, subject_basis, window_seconds, late_data_behavior, condition, reason_template, severity, risk_score]
+      properties:
+        typology: {type: string, maxLength: 100}
+        description: {type: string}
+        execution_modes: {type: array, items: {type: string, enum: [realtime, scheduled, simulation]}}
+        subject_basis: {type: string}
+        window_seconds: {type: integer, minimum: 1, maximum: 31622400}
+        late_data_behavior: {type: string, enum: [reconcile, ignore, observe]}
+        condition: {$ref: "#/components/schemas/AMLScenarioNode"}
+        reason_template: {type: string}
+        severity: {type: string, enum: [low, medium, high, critical]}
+        risk_score: {type: string, pattern: '^(0|[1-9][0-9]*)(\.[0-9]+)?$'}
+        policy_inputs: {type: array, items: {type: string}}
+        minimum_history_seconds: {type: integer, minimum: 0}
+    AMLScenarioCreateCommand:
+      type: object
+      required: [name, version]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 200}
+        description: {type: string}
+        version: {$ref: "#/components/schemas/AMLScenarioVersion"}
+    AMLScenarioSimulation:
+      type: object
+      required: [scenario_version, input]
+      properties:
+        scenario_version: {type: integer, minimum: 1}
+        policy_pack_id: {type: string}
+        input:
+          type: object
+          properties:
+            transaction: {$ref: "#/components/schemas/AMLTransaction"}
+            facts: {type: object, additionalProperties: true}
+            metrics: {type: object, additionalProperties: {type: string}}
+            policy_values: {type: object, additionalProperties: true}
+            screening: {type: object, additionalProperties: {type: boolean}}
+            evidence_ids: {type: array, items: {type: string}}
+            late_data: {type: boolean}
+    AMLPolicyPack:
+      type: object
+      required: [format_version, pack_id, pack_version, issuer, contract_range]
+      properties:
+        format_version: {type: integer, enum: [1]}
+        pack_id: {type: string, maxLength: 200}
+        pack_version: {type: string, maxLength: 100}
+        issuer: {type: string, maxLength: 200}
+        applicability: {type: object, additionalProperties: true}
+        scenario_versions: {type: object, additionalProperties: {type: integer, minimum: 1}}
+        datasets: {type: object, additionalProperties: true}
+        dependencies: {type: object, additionalProperties: {type: string, pattern: '^[a-f0-9]{64}$'}}
+        contract_range: {type: string, enum: [v1]}
+        signature_algorithm: {type: string}
+        signature_key_id: {type: string}
+        signature: {type: string}
+    AMLScreeningResult:
+      type: object
+      required: [subject, kind, provider, dataset_version, normalized_query, matches]
+      properties:
+        subject: {$ref: "#/components/schemas/AMLSubjectReference"}
+        kind: {type: string, enum: [sanctions, pep, adverse_media, internal_watchlist]}
+        provider: {type: string, maxLength: 200}
+        dataset_version: {type: string, maxLength: 200}
+        normalized_query: {type: string, maxLength: 500}
+        evidence_ref: {type: string}
+        matches:
+          type: array
+          maxItems: 100
+          items:
+            type: object
+            required: [reference, match_type, confidence, algorithm]
+            properties:
+              reference: {type: string}
+              match_type: {type: string}
+              confidence: {type: string}
+              algorithm: {type: string, enum: [exact, normalized, provider_fuzzy]}
+              attributes: {type: object, additionalProperties: {type: string}}
+    AMLSourceIdentity:
+      type: object
+      required: [source_system, external_id, source_event_at]
+      properties:
+        source_system:
+          type: string
+          maxLength: 100
+        external_id:
+          type: string
+          maxLength: 200
+        source_event_at:
+          type: string
+          format: date-time
+    AMLMoney:
+      type: object
+      required: [amount, asset_code]
+      properties:
+        amount:
+          type: string
+          description: Exact unsigned decimal with at most 38 digits and 18 fractional digits.
+          pattern: '^(0|[1-9][0-9]*)(\.[0-9]+)?$'
+        asset_code:
+          type: string
+          pattern: '^[A-Z0-9][A-Z0-9._-]{0,15}$'
+        asset_type:
+          type: string
+          enum: [fiat, virtual_asset, security, commodity, other]
+    AMLSubjectReference:
+      type: object
+      required: [type, id]
+      properties:
+        type:
+          type: string
+          enum: [customer, account, beneficial_owner, related_party, counterparty, institution]
+        id:
+          type: string
+          maxLength: 200
+    AMLTransactionLink:
+      type: object
+      required: [type, transaction_id]
+      properties:
+        type:
+          type: string
+          enum: [correction_of, reversal_of, adjustment_of]
+        transaction_id:
+          type: string
+    AMLTransaction:
+      type: object
+      required: [source, event_at, kind, direction, status, money, subjects]
+      properties:
+        id:
+          type: string
+          readOnly: true
+        source:
+          $ref: "#/components/schemas/AMLSourceIdentity"
+        event_at:
+          type: string
+          format: date-time
+        booked_at:
+          type: string
+          format: date-time
+        value_at:
+          type: string
+          format: date-time
+        received_at:
+          type: string
+          format: date-time
+        kind:
+          type: string
+          enum: [payment, cash, card, trade, security, virtual_asset, adjustment, reversal, other]
+        subtype:
+          type: string
+        direction:
+          type: string
+          enum: [inbound, outbound, internal, unknown]
+        status:
+          type: string
+          enum: [pending, posted, settled, rejected, cancelled, reversed]
+        money:
+          $ref: "#/components/schemas/AMLMoney"
+        subjects:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/AMLSubjectReference"
+        related_transaction:
+          $ref: "#/components/schemas/AMLTransactionLink"
+        channel:
+          type: string
+        purpose:
+          type: string
+        origin_country:
+          type: string
+        destination_country:
+          type: string
+        metadata:
+          type: object
+          additionalProperties: true
+        content_fingerprint:
+          type: string
+          readOnly: true
+        mapping_version:
+          type: string
+        source_record:
+          type: string
+        ingested_at:
+          type: string
+          format: date-time
+          readOnly: true
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+    AMLIngestionResponse:
+      type: object
+      required: [id, ingestion_reference, replayed, content_fingerprint, ingested_at]
+      properties:
+        id:
+          type: string
+        ingestion_reference:
+          type: string
+        monitoring_reference:
+          type: string
+          nullable: true
+        replayed:
+          type: boolean
+        content_fingerprint:
+          type: string
+        ingested_at:
+          type: string
+          format: date-time
+    AMLTransactionBatchRequest:
+      type: object
+      required: [transactions]
+      properties:
+        transactions:
+          type: array
+          minItems: 1
+          maxItems: 500
+          items:
+            $ref: "#/components/schemas/AMLTransaction"
+    AMLTransactionPage:
+      type: object
+      required: [items, has_more]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/AMLTransaction"
+        next_cursor:
+          type: string
+        has_more:
+          type: boolean
+    AMLCustomerSnapshotCommand:
+      type: object
+      required: [snapshot]
+      properties:
+        customer_source:
+          $ref: "#/components/schemas/AMLSourceIdentity"
+        snapshot:
+          type: object
+          required: [version, source, effective_from, customer_type]
+          properties:
+            version:
+              type: integer
+              minimum: 1
+            source:
+              $ref: "#/components/schemas/AMLSourceIdentity"
+            effective_from:
+              type: string
+              format: date-time
+            effective_to:
+              type: string
+              format: date-time
+            customer_type:
+              type: string
+            geographies:
+              type: array
+              items:
+                type: string
+            industry:
+              type: string
+            risk_rating:
+              type: string
+            products:
+              type: array
+              items:
+                type: string
+    AMLAccountProfileCommand:
+      type: object
+      required: [profile]
+      properties:
+        account_source:
+          $ref: "#/components/schemas/AMLSourceIdentity"
+        primary_customer_id:
+          type: string
+        profile:
+          type: object
+          required: [version, source, status, effective_from]
+          properties:
+            version:
+              type: integer
+              minimum: 1
+            source:
+              $ref: "#/components/schemas/AMLSourceIdentity"
+            product:
+              type: string
+            status:
+              type: string
+            effective_from:
+              type: string
+              format: date-time
+            effective_to:
+              type: string
+              format: date-time
+    StatusResponse:
+      type: object
+      required: [status, version, build_number]
+      properties:
+        status:
+          type: string
+        version:
+          type: string
+          description: Product version sourced from the root VERSION file at build time.
+        build_number:
+          type: string
+          description: API build identifier supplied by CI or generated as a UTC timestamp.
+    OperationalReadiness:
+      type: object
+      properties:
+        mode:
+          type: string
+        schema_version:
+          type: integer
+        required_schema_version:
+          type: integer
+        enabled_rules:
+          type: integer
+        required_configurations:
+          type: integer
+        failed_notification_attempts:
+          type: integer
+        healthy:
+          type: boolean
+    SavedView:
+      type: object
+      required: [name, module]
+      properties:
+        id:
+          type: string
+          readOnly: true
+        name:
+          type: string
+        module:
+          type: string
+        filters:
+          type: object
+          additionalProperties: true
+        columns:
+          type: array
+          items:
+            type: string
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+    ReadinessResponse:
+      type: object
+      required: [status, version, build_number, redis]
+      properties:
+        status:
+          type: string
+          enum: [ready, not_ready]
+        version:
+          type: string
+        build_number:
+          type: string
+        redis:
+          type: object
+          additionalProperties: true
+        operational:
+          $ref: "#/components/schemas/OperationalReadiness"
+    SimulatorScenario:
+      type: object
+      required: [value, label, request]
+      properties:
+        value:
+          type: string
+        label:
+          type: string
+        repeat:
+          type: boolean
+        request:
+          $ref: "#/components/schemas/TransferCheckRequest"
+    SimulatorMetadata:
+      type: object
+      required: [scenarios]
+      properties:
+        scenarios:
+          type: array
+          items:
+            $ref: "#/components/schemas/SimulatorScenario"
+    AdminLoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+          format: password
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+    Decision:
+      type: string
+      enum: [allow, review, block]
+    AccountStatus:
+      type: string
+      enum: [active, allowed, blocked]
+    Money:
+      type: object
+      required: [amount, currency]
+      properties:
+        amount:
+          type: number
+          format: double
+          minimum: 0
+          exclusiveMinimum: true
+        currency:
+          type: string
+          example: PHP
+    Party:
+      type: object
+      properties:
+        name:
+          type: string
+    Agent:
+      type: object
+      required: [bicfi]
+      properties:
+        bicfi:
+          type: string
+          description: ISO 20022 BICFI agent identifier.
+          example: BOPIPHMM
+        name:
+          type: string
+    AccountRef:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+        iban:
+          type: string
+        bban:
+          type: string
+    PaymentIdentification:
+      type: object
+      required: [end_to_end_id]
+      properties:
+        instruction_id:
+          type: string
+        end_to_end_id:
+          type: string
+        transaction_id:
+          type: string
+        clearing_system_reference:
+          type: string
+    Pacs008Transfer:
+      type: object
+      required:
+        - message_id
+        - creation_date_time
+        - payment_identification
+        - instructed_amount
+        - debtor_account
+        - debtor_agent
+        - creditor_account
+        - creditor_agent
+      properties:
+        message_definition_id:
+          type: string
+          description: Exact ISO 20022 message definition from AppHdr or the payload namespace, when available.
+          example: pacs.008.001.08
+        schema_namespace:
+          type: string
+          example: urn:iso:std:iso:20022:tech:xsd:pacs.008.001.08
+        message_id:
+          type: string
+        creation_date_time:
+          type: string
+          format: date-time
+        payment_identification:
+          $ref: "#/components/schemas/PaymentIdentification"
+        instructed_amount:
+          $ref: "#/components/schemas/Money"
+        interbank_settlement_date:
+          type: string
+          format: date
+        debtor:
+          $ref: "#/components/schemas/Party"
+        debtor_account:
+          $ref: "#/components/schemas/AccountRef"
+        debtor_agent:
+          $ref: "#/components/schemas/Agent"
+        creditor:
+          $ref: "#/components/schemas/Party"
+        creditor_account:
+          $ref: "#/components/schemas/AccountRef"
+        creditor_agent:
+          $ref: "#/components/schemas/Agent"
+        remittance_information:
+          type: string
+        requested_execution_date:
+          type: string
+          format: date
+    TransferCheckRequest:
+      type: object
+      required: [message_type, payload]
+      properties:
+        idempotency_key:
+          type: string
+        message_type:
+          type: string
+          enum: [pacs.008]
+        payload:
+          $ref: "#/components/schemas/Pacs008Transfer"
+        external_scores:
+          type: array
+          description: Versioned model scores with provenance. They remain shadow-only unless `advanced_scoring.policy` explicitly enables the configured champion model.
+          items:
+            $ref: "#/components/schemas/ExternalScore"
+    ExternalScore:
+      type: object
+      required: [model_name, model_version, score, generated_at]
+      properties:
+        model_name: {type: string}
+        model_version: {type: string}
+        score: {type: number, minimum: 0, maximum: 1}
+        reason_codes:
+          type: array
+          items: {type: string}
+        provenance:
+          type: object
+          additionalProperties: true
+        generated_at: {type: string, format: date-time}
+    RuleHit:
+      type: object
+      required: [rule_id, rule_name, score_delta, reason]
+      properties:
+        rule_id:
+          type: string
+        rule_name:
+          type: string
+        outcome:
+          $ref: "#/components/schemas/Decision"
+        score_delta:
+          type: number
+          format: double
+        reason:
+          type: string
+    TransferCheck:
+      type: object
+      required: [id, request, decision, score, reasons, rule_hits, created_at]
+      properties:
+        id:
+          type: string
+        idempotency_key:
+          type: string
+        idempotency_fingerprint:
+          type: string
+        request:
+          $ref: "#/components/schemas/TransferCheckRequest"
+        decision:
+          $ref: "#/components/schemas/Decision"
+        score:
+          type: number
+          format: double
+        reasons:
+          type: array
+          items:
+            type: string
+        rule_hits:
+          type: array
+          items:
+            $ref: "#/components/schemas/RuleHit"
+        created_at:
+          type: string
+          format: date-time
+    PaginatedTransferChecks:
+      type: object
+      required: [items, page, page_size, total]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/TransferCheck"
+        page:
+          type: integer
+        page_size:
+          type: integer
+        total:
+          type: integer
+    TransferCheckExport:
+      type: object
+      required: [generated_at, total, items]
+      properties:
+        generated_at:
+          type: string
+          format: date-time
+        total:
+          type: integer
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/TransferCheck"
+    Account:
+      type: object
+      properties:
+        id:
+          type: string
+        iban:
+          type: string
+        bban:
+          type: string
+        name:
+          type: string
+        status:
+          $ref: "#/components/schemas/AccountStatus"
+        risk_tier:
+          type: string
+        metadata:
+          type: object
+          additionalProperties: true
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+    AccountImportResult:
+      type: object
+      required: [total, imported, failed, items]
+      properties:
+        total:
+          type: integer
+        imported:
+          type: integer
+        failed:
+          type: integer
+        items:
+          type: array
+          items:
+            type: object
+            required: [row, status]
+            properties:
+              row:
+                type: integer
+              id:
+                type: string
+              status:
+                type: string
+                enum: [imported, failed]
+              error:
+                type: string
+    AccountPatch:
+      allOf:
+        - $ref: "#/components/schemas/Account"
+    BehaviorProfile:
+      type: object
+      properties:
+        account_id:
+          type: string
+        segment:
+          type: string
+        window_days:
+          type: integer
+        transfer_count:
+          type: integer
+        cold_start:
+          type: boolean
+        average_amount:
+          type: number
+        max_amount:
+          type: number
+        usual_currencies:
+          type: array
+          items:
+            type: string
+        common_creditors:
+          type: array
+          items:
+            type: string
+        common_debtor_agents:
+          type: array
+          items:
+            type: string
+        common_creditor_agents:
+          type: array
+          items:
+            type: string
+        normal_active_hours:
+          type: array
+          items:
+            type: integer
+        transfers_per_day:
+          type: number
+        amount_deviation_factor:
+          type: number
+        generated_at:
+          type: string
+          format: date-time
+    AccountConfig:
+      type: object
+      properties:
+        account_id:
+          type: string
+          readOnly: true
+        review_threshold:
+          type: number
+          format: double
+          default: 50
+        block_threshold:
+          type: number
+          format: double
+          default: 90
+        disabled_rule_ids:
+          type: array
+          items:
+            type: string
+        validation_fail_decision:
+          $ref: "#/components/schemas/Decision"
+        notify_on_decisions:
+          type: array
+          items:
+            $ref: "#/components/schemas/Decision"
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+    RuleDefinition:
+      type: object
+      description: Portable JSON rule DSL. Use field/op/value for simple rules, or all/any for grouped predicates.
+      additionalProperties: true
+      properties:
+        all:
+          type: array
+          items:
+            $ref: "#/components/schemas/RuleDefinition"
+        any:
+          type: array
+          items:
+            $ref: "#/components/schemas/RuleDefinition"
+        field:
+          type: string
+          enum:
+            - message_type
+            - amount
+            - instructed_amount.amount
+            - currency
+            - instructed_amount.currency
+            - debtor_account.id
+            - creditor_account.id
+            - debtor_agent.bicfi
+            - creditor_agent.bicfi
+            - remittance_information
+            - requested_execution_date
+            - requested_execution_days_ahead
+            - debtor_agent.country
+            - creditor_agent.country
+            - route.country_pair
+            - debtor_account.risk_tier
+            - creditor_account.risk_tier
+            - velocity.debtor_transfer_count
+            - velocity.debtor_amount_sum
+            - velocity.debtor_amount_sum_including_current
+            - velocity.creditor_amount_sum_including_current
+            - velocity.debtor_unique_creditor_count
+            - velocity.debtor_repeated_amount_count
+            - beneficiary.first_time_creditor
+            - account.debtor_metadata_recently_changed
+            - account.creditor_metadata_recently_changed
+            - behavior.profile_transfer_count
+            - behavior.profile_cold_start
+            - behavior.amount_deviation_factor
+            - behavior.currency_drift
+            - behavior.creditor_drift
+            - behavior.debtor_agent_drift
+            - behavior.creditor_agent_drift
+            - behavior.average_amount
+            - behavior.max_amount
+            - behavior.transfers_per_day
+            - behavior.segment
+            - network.score
+            - network.fan_in
+            - network.fan_out
+            - network.pass_through
+            - network.circular_flow
+            - network.rapid_movement
+            - network.unique_debtors
+            - network.unique_creditors
+            - network.inbound_count
+            - network.outbound_count
+            - external.ml_score
+        op:
+          type: string
+          enum: [eq, neq, contains, not_contains, in, not_in, gt, gte, lt, lte, duplicate, duplicate_by_debtor_agent]
+        value:
+          oneOf:
+            - type: string
+            - type: number
+            - type: boolean
+            - type: array
+        outcome:
+          $ref: "#/components/schemas/Decision"
+        score:
+          type: number
+          format: double
+        reason:
+          type: string
+        window_minutes:
+          type: integer
+        window_hours:
+          type: integer
+    RuleSimulationRequest:
+      type: object
+      required: [rule, request]
+      properties:
+        rule:
+          $ref: "#/components/schemas/Rule"
+        request:
+          $ref: "#/components/schemas/TransferCheckRequest"
+    RuleSimulationResponse:
+      type: object
+      required: [matched]
+      properties:
+        matched:
+          type: boolean
+        hit:
+          $ref: "#/components/schemas/RuleHit"
+    RuleBuilderOption:
+      type: object
+      required: [value, label, requires_value]
+      properties:
+        value:
+          type: string
+        label:
+          type: string
+        type:
+          type: string
+        types:
+          type: array
+          items:
+            type: string
+        requires_value:
+          type: boolean
+    RuleBuilderPreset:
+      type: object
+      required: [value, label, mode, outcome, score, reason, conditions]
+      properties:
+        value:
+          type: string
+        label:
+          type: string
+        mode:
+          type: string
+          enum: [all, any]
+        outcome:
+          $ref: "#/components/schemas/Decision"
+        score:
+          type: number
+        reason:
+          type: string
+        conditions:
+          type: array
+          items:
+            $ref: "#/components/schemas/RuleDefinition"
+    RuleBuilderMetadata:
+      type: object
+      required: [fields, operators, modes, outcomes, presets]
+      properties:
+        fields:
+          type: array
+          items:
+            $ref: "#/components/schemas/RuleBuilderOption"
+        operators:
+          type: array
+          items:
+            $ref: "#/components/schemas/RuleBuilderOption"
+        modes:
+          type: array
+          items:
+            $ref: "#/components/schemas/RuleBuilderOption"
+        outcomes:
+          type: array
+          items:
+            $ref: "#/components/schemas/RuleBuilderOption"
+        presets:
+          type: array
+          items:
+            $ref: "#/components/schemas/RuleBuilderPreset"
+    Rule:
+      type: object
+      required: [name, definition]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        scope:
+          type: string
+          description: "`default` or an account id."
+          default: default
+        priority:
+          type: integer
+          default: 100
+        enabled:
+          type: boolean
+          default: true
+        version:
+          type: integer
+          readOnly: true
+        definition:
+          $ref: "#/components/schemas/RuleDefinition"
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+    RulePatch:
+      allOf:
+        - $ref: "#/components/schemas/Rule"
+    RuleRevision:
+      type: object
+      required: [rule_id, version, rule, created_at]
+      properties:
+        rule_id:
+          type: string
+        version:
+          type: integer
+        rule:
+          $ref: "#/components/schemas/Rule"
+        created_at:
+          type: string
+          format: date-time
+    WatchlistEntry:
+      type: object
+      required: [type, value]
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+          enum: [account, name, bic, keyword]
+        value:
+          type: string
+        normalized_value:
+          type: string
+          readOnly: true
+        source:
+          type: string
+          description: Internal source or connector label such as sanctions, PEP, or adverse-media.
+        severity:
+          type: string
+          enum: [low, medium, high, critical]
+        outcome:
+          $ref: "#/components/schemas/Decision"
+        score:
+          type: number
+        reason:
+          type: string
+        enabled:
+          type: boolean
+          default: true
+        metadata:
+          type: object
+          additionalProperties: true
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+    WatchlistEntryPatchRequest:
+      type: object
+      properties:
+        type:
+          type: string
+          enum: [account, name, bic, keyword]
+        value:
+          type: string
+        source:
+          type: string
+        severity:
+          type: string
+        outcome:
+          $ref: "#/components/schemas/Decision"
+        score:
+          type: number
+        reason:
+          type: string
+        enabled:
+          type: boolean
+        metadata:
+          type: object
+          additionalProperties: true
+    WatchlistListResult:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/WatchlistEntry"
+        total:
+          type: integer
+        limit:
+          type: integer
+        offset:
+          type: integer
+    DashboardSummary:
+      type: object
+      required: [total, allow, review, block]
+      properties:
+        total:
+          type: integer
+        allow:
+          type: integer
+        review:
+          type: integer
+        block:
+          type: integer
+    NetworkSummary:
+      type: object
+      properties:
+        window_days:
+          type: integer
+        accounts:
+          type: array
+          items:
+            $ref: "#/components/schemas/NetworkAccountSummary"
+        generated_at:
+          type: string
+          format: date-time
+    NetworkAccountSummary:
+      type: object
+      properties:
+        account_id:
+          type: string
+        inbound_count:
+          type: integer
+        outbound_count:
+          type: integer
+        unique_debtors:
+          type: integer
+        unique_creditors:
+          type: integer
+        shared_debtor_agent_count:
+          type: integer
+        shared_beneficiary_count:
+          type: integer
+        pass_through:
+          type: boolean
+        fan_in:
+          type: boolean
+        fan_out:
+          type: boolean
+        circular_flow:
+          type: boolean
+        rapid_movement:
+          type: boolean
+        score:
+          type: number
+        reasons:
+          type: array
+          items:
+            type: string
+        linked_accounts:
+          type: array
+          items:
+            type: string
+        generated_at:
+          type: string
+          format: date-time
+    AuditEvent:
+      type: object
+      properties:
+        id:
+          type: string
+        action:
+          type: string
+        entity:
+          type: string
+        entity_id:
+          type: string
+        metadata:
+          type: object
+          additionalProperties: true
+        created_at:
+          type: string
+          format: date-time
+    PaginatedAuditEvents:
+      type: object
+      required: [items, page, page_size, total]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/AuditEvent"
+        page:
+          type: integer
+        page_size:
+          type: integer
+        total:
+          type: integer
+    AuditReport:
+      type: object
+      properties:
+        category:
+          type: string
+        generated_at:
+          type: string
+          format: date-time
+        total:
+          type: integer
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/AuditEvent"
+    Webhook:
+      type: object
+      properties:
+        id:
+          type: string
+          readOnly: true
+        url:
+          type: string
+          format: uri
+        type:
+          type: string
+          enum: [payment_processor, notification]
+          description: payment_processor targets receive ISO/payment release and rejection events; notification targets receive review/block intervention alerts.
+        enabled:
+          type: boolean
+        event_filters:
+          type: array
+          items: {type: string}
+          description: Exact event names or `*`; empty accepts all events for the destination type.
+        max_attempts:
+          type: integer
+          minimum: 0
+        backoff_seconds:
+          type: integer
+          minimum: 0
+        payload_version:
+          type: string
+        disable_after_failures:
+          type: integer
+          minimum: 0
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+    WebhookPatchRequest:
+      type: object
+      properties:
+        url:
+          type: string
+          format: uri
+        type:
+          type: string
+          enum: [payment_processor, notification]
+        enabled:
+          type: boolean
+        event_filters:
+          type: array
+          items: {type: string}
+        max_attempts: {type: integer, minimum: 0}
+        backoff_seconds: {type: integer, minimum: 0}
+        payload_version: {type: string}
+        disable_after_failures: {type: integer, minimum: 0}
+    NotificationAttempt:
+      type: object
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        webhook_id:
+          type: string
+        event_id:
+          type: string
+        event_type:
+          type: string
+        transfer_check_id:
+          type: string
+        status:
+          type: string
+          enum: [success, failed]
+        attempt_number:
+          type: integer
+        response_code:
+          type: integer
+        response_body:
+          type: string
+        error:
+          type: string
+        payload:
+          $ref: "#/components/schemas/WebhookEventPayload"
+        created_at:
+          type: string
+          format: date-time
+    WebhookEventPayload:
+      type: object
+      properties:
+        event:
+          type: string
+          enum: [transfer_check.decided, transfer_check.approved, case.resolved_fraud]
+        event_id:
+          type: string
+        transfer_check_id:
+          type: string
+        decision:
+          $ref: "#/components/schemas/Decision"
+        previous_decision:
+          $ref: "#/components/schemas/Decision"
+        approved:
+          type: boolean
+        score:
+          type: number
+        reasons:
+          type: array
+          items:
+            type: string
+        rule_hits:
+          type: array
+          items:
+            $ref: "#/components/schemas/RuleHit"
+        created_at:
+          type: string
+          format: date-time
+        transfer_check_request:
+          $ref: "#/components/schemas/TransferCheckRequest"
+        transfer_check:
+          $ref: "#/components/schemas/TransferCheck"
+        pacs002:
+          $ref: "#/components/schemas/Pacs002StatusReport"
+    Pacs002StatusReport:
+      type: object
+      properties:
+        message_type:
+          type: string
+          example: pacs.002
+        original_message_id:
+          type: string
+        original_message_name_id:
+          type: string
+          example: pacs.008
+        original_instruction_id:
+          type: string
+        original_end_to_end_id:
+          type: string
+        original_transaction_id:
+          type: string
+        transaction_status:
+          type: string
+          description: Canonical ISO 20022-style transaction status, for example ACTC, PDNG, or RJCT.
+        status_reason:
+          type: string
+        decision:
+          $ref: "#/components/schemas/Decision"
+        transfer_check_id:
+          type: string
+        payment_identification:
+          $ref: "#/components/schemas/PaymentIdentification"
+        debtor_agent:
+          $ref: "#/components/schemas/Agent"
+        creditor_agent:
+          $ref: "#/components/schemas/Agent"
+        original_creation_time:
+          type: string
+          format: date-time
+        status_report_create_time:
+          type: string
+          format: date-time
+    PaymentStatusReport:
+      type: object
+      required: [id, event_key, message_type, report_message_id, report_creation_time, original_message_id, transaction_status, transfer_check_id, received_at]
+      properties:
+        id: {type: string}
+        event_key: {type: string}
+        message_type: {type: string, example: pacs.002}
+        business_message_id: {type: string}
+        message_definition_id: {type: string, example: pacs.002.001.10}
+        schema_namespace: {type: string, example: "urn:iso:std:iso:20022:tech:xsd:pacs.002.001.10"}
+        header_from_agent: {$ref: "#/components/schemas/Agent"}
+        header_to_agent: {$ref: "#/components/schemas/Agent"}
+        report_message_id: {type: string}
+        report_creation_time: {type: string, format: date-time}
+        original_message_id: {type: string}
+        original_message_name_id: {type: string, example: pacs.008.001.08}
+        original_creation_time: {type: string, format: date-time}
+        original_number_of_transactions: {type: integer}
+        original_instruction_id: {type: string}
+        original_end_to_end_id: {type: string}
+        original_transaction_id: {type: string}
+        transaction_status: {type: string, example: RJCT}
+        status_reason_code: {type: string, example: AC04}
+        status_reason_information: {type: array, items: {type: string}}
+        acceptance_time: {type: string, format: date-time}
+        clearing_system_reference: {type: string}
+        instructing_agent: {$ref: "#/components/schemas/Agent"}
+        instructed_agent: {$ref: "#/components/schemas/Agent"}
+        interbank_settlement_amount: {$ref: "#/components/schemas/Money"}
+        interbank_settlement_date: {type: string, format: date}
+        transfer_check_id: {type: string}
+        signature_present: {type: boolean}
+        signature_verified: {type: boolean, description: Always false until XMLDSig verification is configured at the trust boundary.}
+        received_at: {type: string, format: date-time}
+    FraudCase:
+      type: object
+      properties:
+        id:
+          type: string
+        transfer_check_id:
+          type: string
+        status:
+          type: string
+          enum: [open, investigating, escalated, resolved_safe, resolved_fraud, false_positive]
+        priority:
+          type: string
+          enum: [low, normal, high, urgent]
+        queue:
+          type: string
+        assignee:
+          type: string
+        outcome_reason:
+          type: string
+        decision:
+          $ref: "#/components/schemas/Decision"
+        score:
+          type: number
+        reasons:
+          type: array
+          items:
+            type: string
+        rule_hits:
+          type: array
+          items:
+            $ref: "#/components/schemas/RuleHit"
+        snapshot:
+          type: object
+          additionalProperties: true
+        due_at:
+          type: string
+          format: date-time
+        closed_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    CaseListResult:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/FraudCase"
+        total:
+          type: integer
+        limit:
+          type: integer
+        offset:
+          type: integer
+    CaseMetrics:
+      type: object
+      properties:
+        total: {type: integer}
+        open: {type: integer}
+        sla_breached: {type: integer}
+        status_counts: {type: object, additionalProperties: {type: integer}}
+        queue_workload: {type: object, additionalProperties: {type: integer}}
+        assignee_workload: {type: object, additionalProperties: {type: integer}}
+        false_positive_rules: {type: object, additionalProperties: {type: integer}}
+        generated_at: {type: string, format: date-time}
+    CasePatchRequest:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [open, investigating, escalated, resolved_safe, resolved_fraud, false_positive]
+        priority:
+          type: string
+        queue:
+          type: string
+        assignee:
+          type: string
+        outcome_reason:
+          type: string
+    CaseAttachment:
+      type: object
+      properties:
+        id:
+          type: string
+        case_id:
+          type: string
+        note_id:
+          type: string
+        name:
+          type: string
+        url:
+          type: string
+        mime_type:
+          type: string
+        size:
+          type: integer
+          format: int64
+        sha256:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+    CaseNote:
+      type: object
+      properties:
+        id:
+          type: string
+        case_id:
+          type: string
+        author:
+          type: string
+        body:
+          type: string
+        attachments:
+          type: array
+          items:
+            $ref: "#/components/schemas/CaseAttachment"
+        created_at:
+          type: string
+          format: date-time
+    CaseNoteCreateRequest:
+      type: object
+      required: [body]
+      properties:
+        author:
+          type: string
+        body:
+          type: string
+        attachments:
+          type: array
+          items:
+            $ref: "#/components/schemas/CaseAttachment"
+    APIKey:
+      type: object
+      properties:
+        id:
+          type: string
+          readOnly: true
+        name:
+          type: string
+        key_prefix:
+          type: string
+          description: Non-secret prefix for identifying the key.
+          readOnly: true
+        scopes:
+          type: array
+          items:
+            type: string
+        active:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Optional expiry timestamp. Omit or leave empty for no expiry.
+    APIKeyCreateRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        scopes:
+          type: array
+          items:
+            type: string
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Optional expiry timestamp.
+    APIKeyCreateResponse:
+      allOf:
+        - $ref: "#/components/schemas/APIKey"
+        - type: object
+          properties:
+            secret:
+              type: string
+              description: Raw client secret shown only at creation time.
+              example: bfd_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    APIKeyPatchRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        scopes:
+          type: array
+          items:
+            type: string
+        active:
+          type: boolean
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+    AdminAccount:
+      type: object
+      properties:
+        id:
+          type: string
+          readOnly: true
+        username:
+          type: string
+        role:
+          type: string
+          enum: [viewer, analyst, operations, super_admin]
+        modules:
+          type: array
+          items:
+            type: string
+          description: Dashboard modules visible to this administrator and enforced by the API session.
+        allowed_ips:
+          type: array
+          items:
+            type: string
+          description: Exact IPs, CIDR ranges, or `*` for any internal/private dashboard client.
+        active:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+    AdminAccountCreateRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+          format: password
+        role:
+          type: string
+          enum: [viewer, analyst, operations, super_admin]
+        modules:
+          type: array
+          items:
+            type: string
+        allowed_ips:
+          type: array
+          items:
+            type: string
+          description: Exact IPs, CIDR ranges, or `*` for any internal/private dashboard client. Defaults to `*`.
+    AdminAccountPatchRequest:
+      type: object
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+          format: password
+        role:
+          type: string
+          enum: [viewer, analyst, operations, super_admin]
+        modules:
+          type: array
+          items:
+            type: string
+        allowed_ips:
+          type: array
+          items:
+            type: string
+          description: Exact IPs, CIDR ranges, or `*` for any internal/private dashboard client.
+        active:
+          type: boolean
+    ConfigurationEntry:
+      type: object
+      required: [value]
+      properties:
+        key:
+          type: string
+          readOnly: true
+        category:
+          type: string
+        value:
+          type: object
+          additionalProperties: true
+        cache_ttl_seconds:
+          type: integer
+          minimum: 0
+          description: TTL for cached config values. Use 0 to skip caching.
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+    DropdownItem:
+      type: object
+      required: [group_id, code_id, label, enabled]
+      properties:
+        group_id:
+          type: string
+          pattern: "^[a-z][a-z0-9_]*$"
+          example: webhook_events
+        code_id:
+          type: string
+          example: transfer_check.decided
+        label:
+          type: string
+          example: Transfer Check Decided
+        sort_order:
+          type: integer
+          minimum: 0
+          example: 10
+        enabled:
+          type: boolean
+          default: true
+    RetentionPurgeRequest:
+      type: object
+      description: Provide either `older_than_days`, explicit cutoff timestamps, or both. Explicit cutoffs override the shared older-than cutoff for their record type.
+      properties:
+        older_than_days:
+          type: integer
+          minimum: 1
+          description: Shared cutoff for transfer checks and audit events.
+        transfer_checks_before:
+          type: string
+          description: RFC3339 timestamp or YYYY-MM-DD date. Transfer checks before this cutoff are deleted; rule hits are deleted with them.
+        audit_events_before:
+          type: string
+          description: RFC3339 timestamp or YYYY-MM-DD date. Audit events before this cutoff are deleted.
+        dry_run:
+          type: boolean
+          default: false
+          description: When true, returns matching counts without deleting records.
+    RetentionPurgeResponse:
+      type: object
+      required: [dry_run, transfer_checks_deleted, audit_events_deleted]
+      properties:
+        dry_run:
+          type: boolean
+        transfer_checks_before:
+          type: string
+          format: date-time
+          nullable: true
+        audit_events_before:
+          type: string
+          format: date-time
+          nullable: true
+        transfer_checks_deleted:
+          type: integer
+          format: int64
+        audit_events_deleted:
+          type: integer
+          format: int64
+        impact:
+          $ref: "#/components/schemas/RetentionImpact"
+    RetentionImpact:
+      type: object
+      properties:
+        transfer_checks: {type: integer, format: int64}
+        rule_hits: {type: integer, format: int64}
+        audit_events: {type: integer, format: int64}
+        cases: {type: integer, format: int64}
+        case_notes: {type: integer, format: int64}
+        case_attachments: {type: integer, format: int64}
+        notification_attempts: {type: integer, format: int64}
+  examples:
+    Pacs008TransferCheckRequest:
+      value:
+        message_type: pacs.008
+        payload:
+          message_id: MSG-20260706-001
+          creation_date_time: "2026-07-06T09:00:00Z"
+          payment_identification:
+            instruction_id: INST-001
+            end_to_end_id: E2E-001
+            transaction_id: TX-001
+          instructed_amount:
+            amount: 1250
+            currency: PHP
+          debtor:
+            name: Juan Sender
+          debtor_account:
+            id: acct-debtor-001
+            bban: PH-DEBTOR-0001
+          debtor_agent:
+            bicfi: DEUTPHMM
+          creditor:
+            name: Maria Receiver
+          creditor_account:
+            id: acct-creditor-001
+            bban: PH-CREDITOR-0001
+          creditor_agent:
+            bicfi: BOPIPHMM
+          remittance_information: invoice 1001
+    InvalidTransferCheckRequest:
+      value:
+        message_type: pacs.008
+        payload:
+          message_id: MSG-20260706-002
+          creation_date_time: "2026-07-06T09:05:00Z"
+          payment_identification:
+            end_to_end_id: E2E-002
+          instructed_amount:
+            amount: 0
+            currency: PHP
+          debtor_account:
+            id: acct-debtor-001
+          debtor_agent:
+            bicfi: DEUTPHMM
+          creditor_account:
+            id: acct-creditor-001
+          creditor_agent:
+            bicfi: BOPIPHMM
+    TransferCheckAllowResponse:
+      value:
+        id: chk-001
+        idempotency_key: sample-transfer-001
+        request:
+          message_type: pacs.008
+          idempotency_key: sample-transfer-001
+          payload:
+            message_id: MSG-20260706-001
+            creation_date_time: "2026-07-06T09:00:00Z"
+            payment_identification:
+              instruction_id: INST-001
+              end_to_end_id: E2E-001
+              transaction_id: TX-001
+            instructed_amount:
+              amount: 1250
+              currency: PHP
+            debtor:
+              name: Juan Sender
+            debtor_account:
+              id: acct-debtor-001
+              bban: PH-DEBTOR-0001
+            debtor_agent:
+              bicfi: DEUTPHMM
+            creditor:
+              name: Maria Receiver
+            creditor_account:
+              id: acct-creditor-001
+              bban: PH-CREDITOR-0001
+            creditor_agent:
+              bicfi: BOPIPHMM
+            remittance_information: invoice 1001
+        decision: allow
+        score: 0
+        reasons:
+          - no fraud signal detected
+        rule_hits: []
+        created_at: "2026-07-06T09:00:01Z"
+    TransferCheckReviewResponse:
+      value:
+        id: chk-002
+        request:
+          message_type: pacs.008
+          payload:
+            message_id: MSG-20260706-003
+            creation_date_time: "2026-07-06T09:10:00Z"
+            payment_identification:
+              end_to_end_id: E2E-003
+            instructed_amount:
+              amount: 15000
+              currency: PHP
+            debtor_account:
+              id: acct-debtor-001
+            debtor_agent:
+              bicfi: DEUTPHMM
+            creditor_account:
+              id: acct-creditor-001
+            creditor_agent:
+              bicfi: BOPIPHMM
+        decision: review
+        score: 60
+        reasons:
+          - high value transfer exceeds review threshold
+        rule_hits:
+          - rule_id: rule-large-amount
+            rule_name: High Value Transfer Review
+            outcome: review
+            score_delta: 60
+            reason: high value transfer exceeds review threshold
+        created_at: "2026-07-06T09:10:01Z"
+    TransferCheckBlockResponse:
+      value:
+        id: chk-003
+        request:
+          message_type: pacs.008
+          payload:
+            message_id: MSG-20260706-004
+            creation_date_time: "2026-07-06T09:15:00Z"
+            payment_identification:
+              end_to_end_id: E2E-004
+            instructed_amount:
+              amount: 100
+              currency: PHP
+            debtor_account:
+              id: acct-blocked-001
+            debtor_agent:
+              bicfi: DEUTPHMM
+            creditor_account:
+              id: acct-creditor-001
+            creditor_agent:
+              bicfi: BOPIPHMM
+        decision: block
+        score: 0
+        reasons:
+          - debtor or creditor account is blocked
+        rule_hits: []
+        created_at: "2026-07-06T09:15:01Z"
+    AccountRequest:
+      value:
+        id: acct-debtor-001
+        bban: PH-DEBTOR-0001
+        name: Juan Sender
+        status: active
+        risk_tier: medium
+        metadata:
+          customer_id: cust-001
+          country: PH
+    AccountResponse:
+      value:
+        id: acct-debtor-001
+        bban: PH-DEBTOR-0001
+        name: Juan Sender
+        status: active
+        risk_tier: medium
+        metadata:
+          customer_id: cust-001
+          country: PH
+        created_at: "2026-07-06T09:00:00Z"
+        updated_at: "2026-07-06T09:00:00Z"
+    AccountConfigRequest:
+      value:
+        review_threshold: 50
+        block_threshold: 90
+        disabled_rule_ids:
+          - rule-test-only
+        validation_fail_decision: review
+        notify_on_decisions:
+          - review
+          - block
+    AccountConfigResponse:
+      value:
+        account_id: acct-debtor-001
+        review_threshold: 50
+        block_threshold: 90
+        disabled_rule_ids:
+          - rule-test-only
+        validation_fail_decision: review
+        notify_on_decisions:
+          - review
+          - block
+        updated_at: "2026-07-06T09:00:00Z"
+    AmountReviewRuleRequest:
+      value:
+        id: rule-large-amount
+        name: High Value Transfer Review
+        scope: default
+        priority: 10
+        enabled: true
+        definition:
+          field: amount
+          op: gte
+          value: 50000
+          outcome: review
+          score: 60
+          reason: high value transfer exceeds review threshold
+    AmountReviewRuleResponse:
+      value:
+        id: rule-large-amount
+        name: High Value Transfer Review
+        scope: default
+        priority: 10
+        enabled: true
+        version: 1
+        definition:
+          field: amount
+          op: gte
+          value: 50000
+          outcome: review
+          score: 60
+          reason: high value transfer exceeds review threshold
+        created_at: "2026-07-06T09:00:00Z"
+        updated_at: "2026-07-06T09:00:00Z"
+    RouteBlockRuleRequest:
+      value:
+        id: rule-risky-route
+        name: Risky creditor agent route
+        scope: default
+        priority: 5
+        enabled: true
+        definition:
+          any:
+            - field: creditor_agent.bicfi
+              op: eq
+              value: RISKUS33
+            - field: currency
+              op: eq
+              value: XTS
+          outcome: block
+          score: 100
+          reason: risky payment route
