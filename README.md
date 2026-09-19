@@ -3,7 +3,7 @@
 Lightweight Go REST microservice for ISO 20022-style bank transfer fraud checks
 and a separate AML/CFT monitoring subsystem.
 
-## Move to as private Repo :( 
+## Moved as private Repo :( 
 For demo contact me: lynolibarra@gmail.com
 
 ## About Byakugan
