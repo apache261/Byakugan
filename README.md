@@ -1,9 +1,10 @@
 # Byakugan
 
-Lightweight Go REST microservice for ISO 20022-style bank transfer fraud checks.
+Lightweight Go REST microservice for ISO 20022-style bank transfer fraud checks
+and a separate AML/CFT monitoring subsystem.
 
-## Decided to move to private Repo
-If you want to demo, message me. lynolibarra2104@gmail.com
+## Move to as private Repo :( 
+For demo contact me: lynolibarra@gmail.com
 
 ## About Byakugan
 
@@ -13,9 +14,16 @@ the Hyuga clan characters such as Hinata and Neji, because the software is meant
 to help admins "see" transfer risk, account behavior, rule hits, and decision
 signals clearly.
 
+Byakugan also supports jurisdiction-neutral anti-money-laundering and
+counter-terrorist-financing (AML/CFT) monitoring. Its AML ledger, scenarios,
+alerts, investigations, and reports are separate from synchronous fraud
+decisions: AML findings do not authorize, reject, or hold payments.
+
 The project is also heavily inspired by Tazama and by the reality that there are
 only a limited number of open-source bank fraud detection applications available
 for learning, prototyping, and lightweight deployments.
+
+I developed this during my free time (since 2024).
 
 ## Features
 
@@ -33,6 +41,9 @@ for learning, prototyping, and lightweight deployments.
 - PostgreSQL schema migrations
 - Dedicated AML canonical domain, append-only persistence, ingestion,
   versioned scenarios/screening, durable monitoring, and explainable alerts
+- AML investigation cases, evidence, four-eyes report approval, legal holds,
+  retention controls, and historical imports with authorized backfills
+- Role-restricted AML/CFT workflows in the standalone admin dashboard
 - Optional Redis client wiring for optimized deployments
 
 ## Stack Used
@@ -134,9 +145,19 @@ http://localhost:9095/docs/openapi.yaml
 
 ## AML/CFT APIs
 
-Phases 2–9 expose internal-only AML ledger, scenario, screening, monitoring,
-alert, investigation, report, hold, retention, and import-control endpoints separately from
-fraud transfer checks:
+**AML support status:** implementation Phases 0–8 are complete. Phase 9 security,
+scale, and release readiness is in progress; its production-like staging,
+restore, performance, and operator approval evidence remains outstanding. See
+[AML_plan_phase.md](AML_plan_phase.md) and the
+[AML release checklist](docs/aml/release-checklist.md). The implemented AML core
+is jurisdiction-neutral. Institution-specific sanctions sources, reporting
+formats, thresholds, and submission connectors require separate configuration
+or adapters; their presence is not implied by the built-in workflows.
+
+Internal-only AML APIs cover customer risk snapshots, accounts, an append-only
+transaction ledger, scenario and screening management, asynchronous monitoring,
+alerts, confidential investigations, reports, legal holds, retention, and
+imports. They are separate from fraud transfer checks:
 
 ```text
 POST /v1/aml/customers/{id}/snapshots
